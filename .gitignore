@@ -1,0 +1,59 @@
+# Dependencies
+node_modules/
+.venv/
+venv/
+
+# Build outputs
+dist/
+dist-ssr/
+build/
+*.egg-info/
+
+# Python caches
+__pycache__/
+*.py[cod]
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.local
+
+# Runtime/model data
+engines/
+models/
+loras/
+checkpoints/
+diffusers/
+outputs/
+exports/
+archives/
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.bin
+
+# Local project notes and generated media
+project.md
+*.log
+*.tmp
+*.bak
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.gif
+*.mp4
+*.webm
+!frontend/public/*.svg
+
+# Editor/OS metadata
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db

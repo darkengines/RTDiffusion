@@ -1,0 +1,23 @@
+[project]
+name = "rtdiffusion-backend"
+version = "0.1.0"
+description = "FastAPI WebSocket backend for real-time diffusion inpainting."
+requires-python = ">=3.10,<3.13"
+dependencies = [
+  "fastapi>=0.115.0",
+  "uvicorn[standard]>=0.30.0",
+  "pillow>=10.4.0",
+  "pydantic>=2.8.0",
+]
+
+[project.optional-dependencies]
+gpu = [
+  "accelerate>=0.33.0",
+  "diffusers>=0.38.0",
+  "safetensors>=0.4.4",
+  "transformers>=4.57.0,<5",
+  "huggingface-hub<1",
+]
+
+[tool.ruff]
+line-length = 100
