@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip show *)",
+      "Bash(pip list *)",
+      "Bash(npm run build 2>&1 *)",
+      "Bash(npm run build)",
+      "Bash(npm run dev *)",
+      "Bash(npm list *)",
+      "Bash(npx vite *)",
+      "Bash(npx tsc *)",
+      "Bash(pip install *)",
+      "Bash(python -m pip *)",
+      "Bash(netstat *)",
+      "Bash(curl -s http://127.0.0.1:* *)",
+      "Bash(curl -s http://localhost:* *)"
+    ]
+  }
+}

@@ -20,6 +20,7 @@ __pycache__/
 .env
 .env.*
 !.env.example
+!.env.docker.example
 *.local
 
 # Runtime/model data

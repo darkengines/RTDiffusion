@@ -3,12 +3,13 @@ setlocal
 
 cd /d "%~dp0"
 
-set RTD_DEVICE=cuda
-set CUDA_VISIBLE_DEVICES=0
+if exist ".env.local" (
+  for /f "usebackq eol=# tokens=1,* delims==" %%a in (".env.local") do if not "%%a"=="" if not defined %%a set "%%a=%%b"
+)
+
+if "%RTD_DEVICE%"=="" set RTD_DEVICE=cuda
 set PYTHONUNBUFFERED=1
 if "%RTD_LOG_LEVEL%"=="" set RTD_LOG_LEVEL=INFO
-set RTD_MODEL_ID=
-set RTD_MODEL_PATH=
 
 for /f "tokens=5" %%a in ('netstat -ano ^| findstr /R /C:":8000 .*LISTENING"') do taskkill /F /PID %%a >nul 2>nul
 
@@ -17,7 +18,7 @@ if not exist ".venv\Scripts\python.exe" (
   exit /b 1
 )
 
-start "RTDiffusion Backend" cmd /k ".venv\Scripts\python.exe -m uvicorn app.main:app --app-dir backend --host 127.0.0.1 --port 8000"
+start "RTDiffusion Backend" cmd /k ".venv\Scripts\python.exe -m uvicorn app.main:app --app-dir backend --host 127.0.0.1 --port 8000 --no-access-log"
 
 pushd frontend
 npm run dev -- --host 127.0.0.1

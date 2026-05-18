@@ -27,8 +27,24 @@ def encode_data_url(image: Image.Image, *, image_format: str = "JPEG", quality: 
     return f"data:{mime};base64,{base64.b64encode(buffer.getvalue()).decode('ascii')}"
 
 
+def data_url_bytes(data_url: str) -> tuple[str, bytes]:
+    header, separator, payload = data_url.partition(",")
+    mime = "image/jpeg"
+    if separator and header.startswith("data:"):
+        mime = header[5:].split(";", 1)[0] or mime
+    return mime, base64.b64decode(payload if separator else data_url)
+
+
 def mask_to_luma(mask: Image.Image) -> Image.Image:
-    return mask.convert("L").point(lambda value: value if value > 12 else 0)
+    """White-act mask normalization (legacy entry point).
+
+    Equivalent to `compose.io.decode_mask(mask, mask.size)` with the default
+    threshold. Kept for callers in `engine.py` that still take a PIL Image
+    directly; new code should call `compose.io.decode_mask` instead.
+    """
+    from .compose.io import decode_mask
+
+    return decode_mask(mask, mask.size)
 
 
 def rgba_to_neutral_rgb(image: Image.Image, neutral: tuple[int, int, int] = (128, 128, 128)) -> Image.Image:
@@ -38,5 +54,11 @@ def rgba_to_neutral_rgb(image: Image.Image, neutral: tuple[int, int, int] = (128
 
 
 def alpha_to_empty_mask(image: Image.Image) -> Image.Image:
-    alpha = image.convert("RGBA").getchannel("A")
-    return alpha.point(lambda value: 255 if value < 250 else 0)
+    """White-act mask built from an RGBA source's transparent pixels (legacy).
+
+    Delegates to `compose.io.decode_empty_alpha_as_mask`. New code should call
+    that helper directly.
+    """
+    from .compose.io import decode_empty_alpha_as_mask
+
+    return decode_empty_alpha_as_mask(image, image.size)

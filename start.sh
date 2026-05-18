@@ -4,10 +4,15 @@ set -eu
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cd "$ROOT"
 
+if [ -f "$ROOT/.env.local" ]; then
+  set -a
+  . "$ROOT/.env.local"
+  set +a
+fi
+
 export RTD_DEVICE=${RTD_DEVICE:-cuda}
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
-unset RTD_MODEL_ID || true
-unset RTD_MODEL_PATH || true
+export RTD_LOG_LEVEL=${RTD_LOG_LEVEL:-INFO}
 
 PYTHON="$ROOT/.venv/Scripts/python.exe"
 if [ ! -x "$PYTHON" ]; then
@@ -18,7 +23,7 @@ if [ ! -x "$PYTHON" ]; then
   exit 1
 fi
 
-"$PYTHON" -m uvicorn app.main:app --app-dir backend --host 127.0.0.1 --port 8000 &
+"$PYTHON" -m uvicorn app.main:app --app-dir backend --host 127.0.0.1 --port 8000 --no-access-log &
 BACKEND_PID=$!
 
 cleanup() {

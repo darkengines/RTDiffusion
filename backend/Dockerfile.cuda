@@ -1,0 +1,35 @@
+FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel
+
+ARG RTD_INSTALL_XFORMERS=1
+ARG RTD_XFORMERS_VERSION=0.0.28.post3
+ARG RTD_INSTALL_TENSORRT=0
+ARG RTD_TENSORRT_VERSION=10.6.0.post2
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    HF_HUB_DISABLE_SYMLINKS_WARNING=1
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg git \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY backend/pyproject.toml /app/backend/pyproject.toml
+COPY backend/app /app/backend/app
+
+RUN python -m pip install --upgrade pip \
+    && python -m pip install -e /app/backend[gpu]
+
+RUN if [ "$RTD_INSTALL_XFORMERS" = "1" ]; then \
+            python -m pip install --no-deps "xformers==${RTD_XFORMERS_VERSION}"; \
+        fi
+
+RUN if [ "$RTD_INSTALL_TENSORRT" = "1" ]; then \
+            python -m pip install --extra-index-url https://pypi.nvidia.com --no-cache-dir "tensorrt==${RTD_TENSORRT_VERSION}" polygraphy cuda-python onnx==1.15.0 onnxruntime-gpu; \
+        fi
+
+EXPOSE 8000
+
+CMD ["python", "-m", "uvicorn", "app.main:app", "--app-dir", "backend", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"]

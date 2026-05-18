@@ -1,0 +1,43 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile.cuda
+      args:
+        RTD_INSTALL_XFORMERS: "1"
+        RTD_INSTALL_TENSORRT: "1"
+    image: rtdiffusion-backend:cuda
+    container_name: rtdiffusion-backend-cuda
+    env_file:
+      - path: .env.docker
+        required: false
+    ports:
+      - "8000:8000"
+    gpus: all
+    ipc: host
+    environment:
+      RTD_DEVICE: ${RTD_DEVICE:-cuda}
+      RTD_LOG_LEVEL: ${RTD_LOG_LEVEL:-INFO}
+      RTD_STREAM_NATIVE: ${RTD_STREAM_NATIVE:-1}
+      RTD_STREAM_DIRECT: ${RTD_STREAM_DIRECT:-0}
+      RTD_STREAM_TINY_VAE: ${RTD_STREAM_TINY_VAE:-1}
+      RTD_STREAM_COMPILE: ${RTD_STREAM_COMPILE:-1}
+      RTD_MODEL_DIRS: ${RTD_MODEL_DIRS:-/models/checkpoints:/models/diffusers:/models/diffusion_models:/models/inpaint:/private-checkpoints}
+      RTD_LORA_DIRS: ${RTD_LORA_DIRS:-/models/loras:/private-loras}
+      RTD_VIDEO_MODEL_DIRS: ${RTD_VIDEO_MODEL_DIRS:-/models/diffusion_models:/models/diffusers:/models/checkpoints}
+      PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+    volumes:
+      - .:/app
+      - ./outputs:/app/outputs
+      - D:/comfyui/comfy/models:/models
+      - ${RTD_PRIVATE_CHECKPOINTS_HOST:-./outputs/private-checkpoints}:/private-checkpoints
+      - ${RTD_PRIVATE_LORAS_HOST:-./outputs/private-loras}:/private-loras
+      - rtdiffusion-hf-cache:/root/.cache/huggingface
+      - rtdiffusion-torch-cache:/root/.cache/torch
+      - rtdiffusion-triton-cache:/root/.triton
+    working_dir: /app
+
+volumes:
+  rtdiffusion-hf-cache:
+  rtdiffusion-torch-cache:
+  rtdiffusion-triton-cache:

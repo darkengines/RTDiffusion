@@ -37,14 +37,3 @@ if (-not (Test-Path $python)) {
 }
 
 $backend = Start-Process -FilePath $python -ArgumentList '-m', 'uvicorn', 'app.main:app', '--app-dir', 'backend', '--host', '127.0.0.1', '--port', "$BackendPort", '--no-access-log' -WorkingDirectory $Root -PassThru
-
-try {
-  Push-Location (Join-Path $Root 'frontend')
-  npm run dev -- --host $FrontendHost
-}
-finally {
-  Pop-Location
-  if ($backend -and -not $backend.HasExited) {
-    Stop-Process -Id $backend.Id -Force
-  }
-}
