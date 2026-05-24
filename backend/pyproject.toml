@@ -8,6 +8,7 @@ dependencies = [
   "uvicorn[standard]>=0.30.0",
   "pillow>=10.4.0",
   "pydantic>=2.8.0",
+  "aiortc>=1.9.0",
 ]
 
 [project.optional-dependencies]

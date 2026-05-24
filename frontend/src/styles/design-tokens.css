@@ -1,0 +1,49 @@
+/* RTDiffusion Design System — DearImGui-inspired dark compact theme */
+:root {
+  color-scheme: dark;
+
+  /* Backgrounds */
+  --bg:        #1a1a1e;
+  --bg-panel:  #24242c;
+  --bg-header: #1e1e28;
+  --bg-popup:  #1c1c24;
+  --bg-input:  #14141a;
+  --bg-hover:  #2e2e3c;
+  --bg-active: #383848;
+  --bg-sel:    #1a3060;
+
+  /* Text */
+  --fg:        #d4d4d8;
+  --fg-dim:    #7a7a8a;
+  --fg-label:  #9898a8;
+  --fg-accent: #7aadff;
+
+  /* Borders */
+  --border:    #3a3a4c;
+  --border-hi: #5a5a7a;
+  --border-focus: #4d87c4;
+
+  /* Accent */
+  --accent:    #4d87c4;
+  --accent-2:  #3060a0;
+  --accent-fg: #ffffff;
+  --stream:    #2d9a3a;
+  --stream-fg: #ffffff;
+  --error:     #c04040;
+  --modified:  #4a9a5a;
+
+  /* Typography */
+  --font-size: 12px;
+  --font-ui: Inter, ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-mono: 'Cascadia Code', 'Consolas', 'Fira Mono', monospace;
+
+  /* Sizing — compact like imgui */
+  --ctrl-h:    22px;
+  --ctrl-h-sm: 18px;
+  --radius:    2px;
+  --radius-lg: 4px;
+  --gap:       4px;
+  --gap-lg:    8px;
+  --pad-x:     6px;
+  --pad-y:     3px;
+}

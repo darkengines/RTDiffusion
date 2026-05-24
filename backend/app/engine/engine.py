@@ -4,176 +4,116 @@ import logging
 import gc
 import random
 import time
-from dataclasses import dataclass
 from math import ceil
 from pathlib import Path
 from typing import Any, Callable, cast
 
 from PIL import Image, ImageChops, ImageEnhance, ImageFilter, ImageOps, ImageStat
 
-from .config import load_local_env
+from ..config import load_local_env
+from ..assets import LORA_DIRS, default_model_path
+from ..image_io import alpha_to_empty_mask, data_url_bytes, decode_data_url, decode_data_url_rgba, encode_data_url, mask_to_luma, rgba_to_neutral_rgb
+from ..layerdiffuse import LayerDiffuseDecoder
+from ..pipeline_graph import resolve_conditioning_mask
+from ..schemas import InpaintFrame, InpaintResult, LayerCondition, LayerGenerateFrame, LayerGenerateResult, LayerVariation
+from ..session_paths import configure_torch_compile_cache, ensure_session_layout
+from .. import controlnet as _cn_module
 
-from .assets import LORA_DIRS, default_model_path
-from .image_io import alpha_to_empty_mask, decode_data_url, decode_data_url_rgba, encode_data_url, mask_to_luma, rgba_to_neutral_rgb
-from .layerdiffuse import LayerDiffuseDecoder
-from .pipeline_graph import resolve_conditioning_mask
-from .schemas import InpaintFrame, InpaintResult, LayerCondition, LayerGenerateFrame, LayerGenerateResult, LayerVariation
-from . import controlnet as _cn_module
+from .config import EngineConfig, ProgressCallback, ChunkCallback
+from .accels import _UNetONNXWrapper, _TRTUNetRunner, _collect_engine_debug
+from .regional_attention import RegionalAttentionRegion, RegionalAttentionSpec, regional_attention_context
 
 load_local_env()
 
 logger = logging.getLogger("rtdiffusion.engine")
+_MASK_F32_MIME = "application/x-rtd-mask-f32"
+_MASK_F32_MAGIC = b"RTF1"
+
+
+def _decode_cfg_mask_data_url(data_url: str, width: int, height: int) -> Image.Image:
+    mime, encoded_bytes = data_url_bytes(data_url)
+    if mime == _MASK_F32_MIME:
+        import numpy as np
+        if len(encoded_bytes) < 12 or encoded_bytes[:4] != _MASK_F32_MAGIC:
+            raise ValueError("invalid float32 CFG mask header")
+        src_w = int.from_bytes(encoded_bytes[4:8], "little", signed=False)
+        src_h = int.from_bytes(encoded_bytes[8:12], "little", signed=False)
+        expected = 12 + src_w * src_h * 4
+        if src_w <= 0 or src_h <= 0 or len(encoded_bytes) != expected:
+            raise ValueError("invalid float32 CFG mask payload")
+        arr = np.frombuffer(encoded_bytes, dtype="<f4", offset=12).reshape((src_h, src_w)).astype(np.float32, copy=True)
+        img = Image.fromarray(arr, "F")
+        return img.resize((width, height), Image.Resampling.BILINEAR) if img.size != (width, height) else img
+    mask = decode_data_url(data_url).convert("L")
+    return mask.resize((width, height), Image.Resampling.BILINEAR)
+
+
+def _cfg_mask_absolute_mean(mask: Image.Image) -> float:
+    import numpy as np
+    if mask.mode == "F":
+        arr = np.asarray(mask, dtype=np.float32)
+        return float(np.clip(arr, 0.0, 30.0).mean())
+    if mask.mode in ("I;16", "I;16B"):
+        arr = np.asarray(mask, dtype=np.float32) / 65535.0 * 30.0
+        return float(np.clip(arr, 0.0, 30.0).mean())
+    if mask.mode != "L":
+        mask = mask.convert("L")
+    arr = np.asarray(mask, dtype=np.float32) / 255.0 * 30.0
+    return float(np.clip(arr, 0.0, 30.0).mean())
+
+
+def _cfg_mask_attention_alpha(mask: Image.Image) -> Image.Image:
+    import numpy as np
+    if mask.mode == "F":
+        arr = np.clip(np.asarray(mask, dtype=np.float32) / 30.0, 0.0, 1.0)
+        return Image.fromarray((arr * 255.0).astype(np.uint8), "L")
+    if mask.mode in ("I;16", "I;16B"):
+        arr = np.clip(np.asarray(mask, dtype=np.float32) / 65535.0, 0.0, 1.0)
+        return Image.fromarray((arr * 255.0).astype(np.uint8), "L")
+    return mask.convert("L")
+
+
+def _decode_luma_mask_data_url(data_url: str, width: int, height: int) -> Image.Image:
+    mask = decode_data_url(data_url).convert("L")
+    return mask.resize((width, height), Image.Resampling.BILINEAR)
+
+
+def _scale_luma_mask(mask: Image.Image, scale: float) -> Image.Image:
+    scale = max(0.0, min(4.0, float(scale)))
+    lut = [int(round(max(0.0, min(255.0, value * scale)))) for value in range(256)]
+    return mask.convert("L").point(lut)
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
 
 
 def is_cuda_device(device: str) -> bool:
     return device == "cuda" or device.startswith("cuda:")
 
 
-@dataclass
-class EngineConfig:
-    model_id: str = os.getenv("RTD_MODEL_ID") or os.getenv("RTD_MODEL_PATH") or ""
-    device: str = os.getenv("RTD_DEVICE", "cuda")
-    guidance_scale: float = float(os.getenv("RTD_GUIDANCE_SCALE", "1.5"))
-    compile_unet: bool = os.getenv("RTD_COMPILE", "0") == "1"
-    attention_slicing: bool = os.getenv("RTD_ATTENTION_SLICING", "0") == "1"
-    force_mock: bool = os.getenv("RTD_MOCK", "0") == "1"
-    layer_batch_size: int = max(1, int(os.getenv("RTD_LAYER_BATCH_SIZE", "4")))
-    transparent_layer_batch_size: int = max(1, int(os.getenv("RTD_TRANSPARENT_LAYER_BATCH_SIZE", "1")))
-    z_image_base_model: str = os.getenv("RTD_Z_IMAGE_BASE_MODEL", "Tongyi-MAI/Z-Image-Turbo")
-    z_image_local_only: bool = os.getenv("RTD_Z_IMAGE_LOCAL_ONLY", "0") == "1"
-    realtime_accel: bool = os.getenv("RTD_REALTIME_ACCEL", "1") == "1"
-    ssf_image_threshold: float = float(os.getenv("RTD_SSF_IMAGE_THRESHOLD", "9.0"))
-    ssf_mask_threshold: float = float(os.getenv("RTD_SSF_MASK_THRESHOLD", "6.0"))
-    ssf_skip_probability: float = float(os.getenv("RTD_SSF_SKIP_PROBABILITY", "0.96"))
-    ssf_max_skips: int = max(1, int(os.getenv("RTD_SSF_MAX_SKIPS", "12")))
-    stream_compile: bool = os.getenv("RTD_STREAM_COMPILE", "0" if os.name == "nt" else "1") == "1"
-    stream_direct: bool = os.getenv("RTD_STREAM_DIRECT", "0") == "1"
-    stream_native: bool = os.getenv("RTD_STREAM_NATIVE", "1") == "1"
-    stream_tiny_vae: bool = os.getenv("RTD_STREAM_TINY_VAE", "1") == "1"
-    stream_warmup: int = max(0, int(os.getenv("RTD_STREAM_WARMUP", "0")))
-    stream_lcm_lora: bool = os.getenv("RTD_STREAM_LCM_LORA", "1") == "1"
-    stream_trt: bool = os.getenv("RTD_STREAM_TRT", "0") == "1"
-    stream_trt_fp16: bool = os.getenv("RTD_STREAM_TRT_FP16", "1") == "1"
-    stream_trt_cache_dir: str = os.getenv("RTD_STREAM_TRT_CACHE", "outputs/trt-engines")
-
-
-ProgressCallback = Callable[[str, float, str, LayerGenerateResult | None], None]
-ChunkCallback = Callable[[list[tuple[int, Image.Image]], float, str], None]
-
-
-class _UNetONNXWrapper:
-    """Flattens dict inputs so the UNet callable is wrappable for ONNX export.
-
-    Not a nn.Module itself — use make_unet_onnx_module(torch, unet, has_sdxl_cond) to get an
-    exportable nn.Module (defined at call-time when torch is already imported).
+def _triton_available() -> bool:
+    """torch.compile's inductor backend needs Triton, which has no Windows wheels
+    as of late 2025. Detect at startup and gate all compile sites on this so we
+    don't crash on first forward pass with "Cannot find a working triton".
     """
-
-    def __init__(self, unet: Any, has_sdxl_cond: bool) -> None:
-        self._unet = unet
-        self._has_sdxl_cond = has_sdxl_cond
-
-    def __call__(self, sample, timestep, encoder_hidden_states, text_embeds, time_ids):
-        kwargs: dict[str, Any] = {"encoder_hidden_states": encoder_hidden_states, "return_dict": False}
-        if self._has_sdxl_cond:
-            kwargs["added_cond_kwargs"] = {"text_embeds": text_embeds, "time_ids": time_ids}
-        return (self._unet(sample, timestep, **kwargs)[0],)
+    try:
+        import triton  # noqa: F401
+        return True
+    except Exception:
+        return False
 
 
-class _TRTUNetRunner:
-    """Drop-in replacement for a PyTorch UNet — runs inference via a TensorRT engine.
-
-    The engine is pre-built for a fixed batch size and latent resolution.
-    Output is written to a pre-allocated buffer that is reused every frame.
-    """
-
-    def __init__(self, engine_bytes: bytes, out_shape: tuple, has_sdxl_cond: bool) -> None:
-        try:
-            import tensorrt as trt  # type: ignore[import-untyped]
-        except ImportError as exc:
-            raise RuntimeError("tensorrt package required for RTD_STREAM_TRT=1") from exc
-        runtime = trt.Runtime(trt.Logger(trt.Logger.WARNING))
-        self._engine = runtime.deserialize_cuda_engine(engine_bytes)
-        if self._engine is None:
-            raise RuntimeError("TRT engine deserialization failed")
-        self._ctx = self._engine.create_execution_context()
-        self._out_shape = out_shape
-        self._has_sdxl_cond = has_sdxl_cond
-        self._out_buf: Any = None
-
-    def __call__(
-        self,
-        sample,
-        timestep,
-        encoder_hidden_states: Any = None,
-        added_cond_kwargs: Any = None,
-        return_dict: bool = False,
-        **_: Any,
-    ):
-        import torch
-
-        if self._out_buf is None or self._out_buf.shape != self._out_shape:
-            self._out_buf = torch.empty(self._out_shape, device=sample.device, dtype=sample.dtype)
-
-        tensors: dict[str, Any] = {
-            "sample": sample.contiguous(),
-            "timestep": timestep.contiguous(),
-            "encoder_hidden_states": encoder_hidden_states.contiguous(),
-        }
-        if self._has_sdxl_cond and added_cond_kwargs:
-            tensors["text_embeds"] = added_cond_kwargs["text_embeds"].contiguous()
-            tensors["time_ids"] = added_cond_kwargs["time_ids"].contiguous()
-
-        for name, t in tensors.items():
-            self._ctx.set_tensor_address(name, t.data_ptr())
-        self._ctx.set_tensor_address("noise_pred", self._out_buf.data_ptr())
-
-        stream_handle = torch.cuda.current_stream().cuda_stream
-        self._ctx.execute_async_v3(stream_handle=stream_handle)
-        return (self._out_buf,)
+_TRITON_OK = _triton_available()
+if not _TRITON_OK:
+    logger.info("Triton not available — torch.compile will be skipped (set RTD_COMPILE=0 to silence).")
 
 
-def _collect_engine_debug(
-    image: "Image.Image",
-    mask: "Image.Image",
-    output: "Image.Image",
-    frame: "InpaintFrame",
-) -> dict[str, str]:
-    """Build 320×180 JPEG thumbnail dict for the debug overlay (engine/WebSocket path)."""
-    import base64, io as _io
-    from PIL import Image as _PIL
-    from .image_io import encode_data_url as _enc
-    thumb = (320, 180)
 
-    def _thumb_b64(img: "Image.Image") -> str:
-        t = img.convert("RGB")
-        t.thumbnail(thumb, _PIL.BILINEAR)
-        buf = _io.BytesIO()
-        t.save(buf, format="JPEG", quality=65)
-        return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
 
-    channels: dict[str, str] = {
-        "canvas": _thumb_b64(image),
-        "mask": _thumb_b64(mask.convert("RGB")),
-        "output": _thumb_b64(output),
-    }
-    # Include preprocessed CN images from layer conditions
-    from . import controlnet as _cn
-    for cond in (frame.layer_conditions or []):
-        if not cond.controlnet_model:
-            continue
-        try:
-            from .image_io import decode_data_url
-            src = decode_data_url(cond.controlnet_image or cond.image).convert("RGB")
-            from .schemas import ControlNetPreprocessorParams
-            params = cond.controlnet_preprocessor_params or ControlNetPreprocessorParams()
-            if cond.controlnet_preprocessor:
-                preprocessed = _cn.preprocess_image(src.resize((frame.width, frame.height)), cond.controlnet_model, params)
-            else:
-                preprocessed = src.resize((frame.width, frame.height))
-            channels[f"cn:{cond.controlnet_model}"] = _thumb_b64(preprocessed)
-        except Exception:
-            pass
-    return channels
 
 
 class DiffusionEngine:
@@ -196,6 +136,7 @@ class DiffusionEngine:
         self._latent_stream: dict[str, object] | None = None
         self._stream_compiled_signature: tuple[object, ...] | None = None
         self._stream_unet_callable: Any | None = None
+        self._compile_unet_active = False
         self._stream_vae: Any | None = None
         self._stream_vae_signature: tuple[object, ...] | None = None
         self._lcm_lora_adapter: str | None = None
@@ -203,6 +144,8 @@ class DiffusionEngine:
         self._trt_runners: dict[str, Any] = {}
         self._seed_state: dict[str, object] | None = None
         self._cn_pipe_cache: dict[str, Any] = {}  # key = cn_model_id → wrapped pipeline
+        # Per-frame step progress — updated by on_step_end, polled by GET /system/tasks
+        self._inpaint_step_info: dict = {"step": 0, "total": 0, "active": False, "device": self.config.device}
         self._load_pipeline()
 
     def _load_pipeline(self) -> None:
@@ -281,15 +224,21 @@ class DiffusionEngine:
             pipe.set_progress_bar_config(disable=True)
             if self.config.attention_slicing and hasattr(pipe, "enable_attention_slicing"):
                 pipe.enable_attention_slicing()
+                logger.info("Attention slicing enabled")
             if hasattr(pipe, "enable_xformers_memory_efficient_attention"):
                 try:
                     pipe.enable_xformers_memory_efficient_attention()
-                except Exception:
-                    pass
+                    logger.info("xformers memory-efficient attention enabled")
+                except Exception as _xf_exc:
+                    logger.info("xformers not available, falling back to PyTorch SDPA (%s)", _xf_exc)
+            elif is_cuda_device(self.config.device):
+                logger.info("Using PyTorch SDPA (xformers not installed)")
             if is_cuda_device(self.config.device) and hasattr(pipe, "unet"):
                 pipe.unet.to(memory_format=torch.channels_last)
-            if self.config.compile_unet and hasattr(torch, "compile"):
-                pipe.unet = torch.compile(pipe.unet, mode="reduce-overhead", fullgraph=True)
+                logger.info("UNet set to channels_last memory format")
+            self._compile_unet_active = False
+            if self.config.compile_unet:
+                self._compile_unet_active = self._compile_loaded_unet(pipe)
             self.pipe = pipe
             self._stream_unet_callable = None
             self.layer_pipe = None
@@ -299,6 +248,10 @@ class DiffusionEngine:
             self.current_sampler = None
             family = f"{self.pipeline_family}/" if self.pipeline_family != "sd" else ""
             self.mode = f"{family}{self.pipeline_kind}: {model_id}"
+            logger.info(
+                "Pipeline loaded: %s | dtype=%s | device=%s",
+                self.mode, dtype, self.config.device,
+            )
         except Exception:
             gc.collect()
             try:
@@ -311,6 +264,53 @@ class DiffusionEngine:
                 logger.exception("Failed while clearing CUDA memory after pipeline load failure")
             logger.exception("Failed to load diffusion pipeline")
             raise
+
+    def _compile_loaded_unet(self, pipe: Any | None = None) -> bool:
+        import torch
+
+        target_pipe = pipe or self.pipe
+        if target_pipe is None or not hasattr(target_pipe, "unet"):
+            logger.info("torch.compile skipped — no UNet is loaded")
+            return False
+        if not hasattr(torch, "compile"):
+            logger.info("torch.compile skipped — this PyTorch build has no torch.compile")
+            return False
+        if not _TRITON_OK:
+            logger.info("torch.compile skipped — Triton not available on this platform")
+            return False
+        compile_mode = os.getenv("RTD_COMPILE_MODE", "default")
+        fullgraph = _env_flag("RTD_COMPILE_FULLGRAPH", False)
+        manifest_path = configure_torch_compile_cache(
+            self.config.session_directory,
+            model_id=self.model_id or self.config.model_id,
+            device=self.config.device,
+            backend="diffusers_unet",
+        ) if self.config.session_directory else None
+        try:
+            logger.info(
+                "torch.compile enabled for UNet (mode=%s, fullgraph=%s, cache=%s); first forward will compile kernels",
+                compile_mode,
+                fullgraph,
+                manifest_path.parent if manifest_path else "default",
+            )
+            target_pipe.unet = torch.compile(target_pipe.unet, mode=compile_mode, fullgraph=fullgraph)
+            return True
+        except Exception as exc:
+            logger.warning("torch.compile failed for UNet; continuing eager (%s)", exc)
+            return False
+
+    def compile_status(self) -> dict[str, object]:
+        pipe = self.pipe
+        unet = getattr(pipe, "unet", None) if pipe is not None else None
+        original = getattr(unet, "_orig_mod", None)
+        return {
+            "triton_available": _TRITON_OK,
+            "requested": bool(self.config.compile_unet),
+            "active": bool(self._compile_unet_active and original is not None),
+            "unet_compiled": original is not None,
+            "wrapper": type(unet).__name__ if unet is not None else "",
+            "original": type(original).__name__ if original is not None else "",
+        }
 
     @staticmethod
     def _normalize_diffusers_model_id(model_id: str) -> str:
@@ -413,7 +413,7 @@ class DiffusionEngine:
         )
         empty_mask = alpha_to_empty_mask(source)
         mask = ImageChops.lighter(manual_mask, empty_mask)
-        mask, base_frame = self._mask_with_layer_conditions(mask, base_frame)
+        mask, base_frame, resolved_denoise_map = self._mask_with_layer_conditions(mask, base_frame)
         image = self._apply_stochastic_blur(image, mask, base_frame.stochastic_blur if not base_frame.stream_diffusion else 0)
         reused = None if base_frame.transparent_background else self._reuse_stochastic_similarity_frame(frame, base_frame, image, mask)
         if reused is not None:
@@ -428,10 +428,17 @@ class DiffusionEngine:
         self._apply_sampler(frame.sampler, frame.scheduler)
         output = self._mock_inpaint(image, mask, base_frame.prompt)
         if self.pipe is not None:
-            output = self._diffusers_inpaint(image, mask, base_frame)
+            strategy = base_frame.render_strategy
+            if strategy == "per_layer" and base_frame.layer_conditions:
+                output = self._per_layer_inpaint(image, mask, base_frame)
+            elif strategy == "tiled":
+                output = self._tiled_inpaint(image, mask, base_frame)
+            else:
+                output = self._diffusers_inpaint(image, mask, base_frame)
+                output = self._apply_layer_region_conditions(output, base_frame)
         output = self._apply_residual_cfg(output, mask, base_frame)
         output = self._apply_zero_denoise_layer_constraints(output, frame)
-        output = self._apply_layer_region_conditions(output, frame)
+        output = self._apply_layer_soft_alpha_compositing(output, image, frame)
         output = self._apply_transparent_background(output, base_frame)
         self._remember_stochastic_similarity_frame(frame, base_frame, image, mask, output)
         latency_ms = (time.perf_counter() - started) * 1000
@@ -439,7 +446,7 @@ class DiffusionEngine:
 
         debug_channels: dict[str, str] = {}
         if frame.debug_streams:
-            debug_channels = _collect_engine_debug(image, mask, output, frame)
+            debug_channels = _collect_engine_debug(image, mask, output, frame, denoise_map=resolved_denoise_map)
 
         return InpaintResult(
             image=encode_data_url(output, image_format="PNG" if base_frame.transparent_background else "JPEG"),
@@ -640,7 +647,7 @@ class DiffusionEngine:
         blur_mask = mask.filter(ImageFilter.GaussianBlur(max(1.0, radius * 0.5)))
         return Image.composite(blurred, image, blur_mask)
 
-    def _sampling_signature(self, frame: InpaintFrame) -> tuple[object, ...]:
+    def _sampling_signature(self, frame: InpaintFrame, include_cfg: bool = True) -> tuple[object, ...]:
         conditions = tuple(
             (
                 condition.name,
@@ -665,11 +672,12 @@ class DiffusionEngine:
             frame.height,
             frame.steps,
             round(frame.strength, 4),
-            round(frame.cfg, 4),
+            round(frame.cfg, 4) if include_cfg else None,
             frame.sampler,
             frame.scheduler,
             frame.stream_diffusion,
             tuple(frame.stream_timestep_indices),
+            frame.stream_quality,
             frame.stream_frame_buffer_size,
             frame.stream_cfg_type,
             round(frame.stream_similarity_threshold, 4),
@@ -702,6 +710,8 @@ class DiffusionEngine:
         negative_parts = [frame.negative_prompt.strip()] if frame.negative_prompt.strip() else []
         z_image_layout_parts: list[str] = []
         for condition in sorted(frame.layer_conditions, key=lambda item: (item.schedule_start, item.schedule_end)):
+            if condition.mode != "prompt_mix":
+                continue
             if not condition.prompt.strip() and not condition.negative_prompt.strip():
                 continue
             if self._schedule_influence(condition.schedule, condition.schedule_start, condition.schedule_end) <= 0:
@@ -715,6 +725,15 @@ class DiffusionEngine:
                 logger.exception("Failed to decode regional layer condition image for prompt conditioning")
                 coverage = 0.0
             influence = max(0.0, min(1.0, coverage * condition.weight))
+            if condition.prompt.strip() and influence <= 0.002:
+                # Prompt-only layer (empty or near-empty alpha): no regional placement
+                # is possible, but the prompt should still describe the scene globally.
+                # Without this, a "factory background" layer with no fill is silently
+                # dropped and the model sees a blank prompt over a dark input.
+                prompt_parts.append(condition.prompt.strip())
+                if condition.negative_prompt.strip():
+                    negative_parts.append(condition.negative_prompt.strip())
+                continue
             if influence <= 0.002:
                 continue
             if condition.prompt.strip() and alpha is not None:
@@ -735,13 +754,13 @@ class DiffusionEngine:
             }
         )
 
-    def _mask_with_layer_conditions(self, mask: Image.Image, frame: InpaintFrame) -> tuple[Image.Image, InpaintFrame]:
+    def _mask_with_layer_conditions(self, mask: Image.Image, frame: InpaintFrame) -> tuple[Image.Image, InpaintFrame, Image.Image | None]:
         if not frame.layer_conditions:
-            return mask, frame
+            return mask, frame, None
         resolved = resolve_conditioning_mask(mask, list(frame.layer_conditions), frame.width, frame.height, frame.strength)
         if abs(resolved.strength - frame.strength) <= 0.0005:
-            return resolved.mask, frame
-        return resolved.mask, frame.model_copy(update={"strength": resolved.strength})
+            return resolved.mask, frame, resolved.denoise_map
+        return resolved.mask, frame.model_copy(update={"strength": resolved.strength}), resolved.denoise_map
 
     @staticmethod
     def _regional_prompt_text(prompt: str, alpha: Image.Image, width: int, height: int, z_image: bool = False) -> str:
@@ -869,19 +888,28 @@ class DiffusionEngine:
         if not frame.layer_conditions:
             return output
         current = output.convert("RGB")
-        for condition in frame.layer_conditions:
+        base_prompt = (frame.prompt or "").strip()
+        conditions = sorted(frame.layer_conditions, key=lambda item: item.z_index if item.z_index is not None else 0)
+        for condition in conditions:
             mode = condition.mode if condition.mode in {"mask", "add", "multiply", "override"} else "prompt_mix"
             if mode == "prompt_mix":
                 continue
             if mode == "mask":
                 denoise = condition.denoise if condition.denoise is not None else frame.strength
                 denoise = max(0.0, min(0.999, denoise))
-                # Plain mask denoise is resolved in the shared conditioning graph.
-                # A CN-enabled layer still needs a regional pass because Diffusers
-                # ControlNet is a separate pipeline in the non-streaming renderer.
-                if not condition.controlnet_model:
-                    continue
                 if denoise <= 0:
+                    continue
+                # Regional inpaint runs for mode="mask" layers when the layer has
+                # a distinct prompt (or its own ControlNet). Without this, the
+                # supposedly-"regional" prompt only manifests as a weak spatial
+                # hint inside the merged global prompt, which SDXL doesn't follow
+                # reliably — so two complementary layers end up looking identical
+                # to a single-prompt inpaint. ControlNet-only layers still need
+                # the regional pass to apply the CN model.
+                layer_prompt = (condition.prompt or "").strip()
+                if not condition.controlnet_model and not layer_prompt:
+                    # Pure mask without prompt/CN → global pass already handled
+                    # the shared denoise mask.
                     continue
             try:
                 condition_image = decode_data_url_rgba(condition.image).resize((frame.width, frame.height), Image.Resampling.LANCZOS)
@@ -898,25 +926,36 @@ class DiffusionEngine:
             def scale_alpha(value: int) -> int:
                 return int(max(0.0, min(1.0, (value / 255) * condition.weight)) * 255)
 
-            influence_mask = alpha.point(scale_alpha)
-            if not influence_mask.getbbox():
+            prompt_mask = alpha.point(scale_alpha)
+            if not prompt_mask.getbbox():
                 continue
             condition_source = current
             prompt = condition.prompt.strip()
             negative_prompt = condition.negative_prompt.strip()
-            if mode != "override":
+            if mode in {"add", "multiply"}:
                 prompt = ", ".join(part for part in [frame.prompt.strip(), prompt] if part)
                 negative_prompt = ", ".join(part for part in [frame.negative_prompt.strip(), negative_prompt] if part)
             elif not prompt:
                 prompt = frame.prompt
             denoise = condition.denoise if condition.denoise is not None else frame.strength
+            denoise = max(0.0, min(0.999, denoise))
+            denoise_base_mask = prompt_mask
+            if condition.denoise_mask:
+                try:
+                    denoise_base_mask = _decode_luma_mask_data_url(condition.denoise_mask, frame.width, frame.height)
+                except Exception:
+                    logger.warning("Failed to decode denoise mask for %s", condition.name or condition.layer_id, exc_info=True)
+            influence_mask = _scale_luma_mask(denoise_base_mask, denoise * condition.weight * self._schedule_influence(condition.schedule, condition.schedule_start, condition.schedule_end))
+            if not influence_mask.getbbox():
+                continue
+            condition_cfg = self._condition_effective_cfg(condition, frame.cfg, frame.width, frame.height)
             condition_frame = frame.model_copy(
                 update={
                     "prompt": prompt,
                     "negative_prompt": negative_prompt,
                     "model_path": condition.model_path or frame.model_path,
                     "lora_paths": condition.lora_paths or frame.lora_paths,
-                    "cfg": condition.cfg if condition.cfg is not None else frame.cfg,
+                    "cfg": condition_cfg,
                     "steps": condition.steps if condition.steps is not None else frame.steps,
                     "strength": denoise if mode == "mask" else denoise,
                     "sampler": condition.sampler or frame.sampler,
@@ -926,7 +965,7 @@ class DiffusionEngine:
             )
             self._ensure_runtime(condition_frame)
             self._apply_sampler(condition_frame.sampler, condition_frame.scheduler)
-            regional = self._mock_inpaint(condition_source, influence_mask, condition_frame.prompt)
+            regional = self._mock_inpaint(condition_source, prompt_mask, condition_frame.prompt)
             if self.pipe is not None:
                 if condition.controlnet_model:
                     # Resolve ControlNet guidance image
@@ -938,13 +977,83 @@ class DiffusionEngine:
                     )
                     if control_image is not None:
                         regional = self._diffusers_controlnet_inpaint(
-                            condition_source, influence_mask, control_image, condition, condition_frame
+                            condition_source, prompt_mask, control_image, condition, condition_frame
                         )
                     else:
-                        regional = self._diffusers_inpaint(condition_source, influence_mask, condition_frame)
+                        regional = self._diffusers_inpaint(condition_source, prompt_mask, condition_frame)
                 else:
-                    regional = self._diffusers_inpaint(condition_source, influence_mask, condition_frame)
+                    regional = self._diffusers_inpaint(condition_source, prompt_mask, condition_frame)
             current = self._composite_region_condition(current, regional, influence_mask, mode)
+        return current
+
+    @staticmethod
+    def _condition_effective_cfg(condition: "LayerCondition", fallback_cfg: float, width: int, height: int) -> float:
+        cfg = condition.cfg if condition.cfg is not None else fallback_cfg
+        if not condition.cfg_mask:
+            return cfg
+        try:
+            mask = _decode_cfg_mask_data_url(condition.cfg_mask, width, height)
+        except Exception:
+            logger.warning("Failed to decode CFG mask for %s", condition.name or condition.layer_id, exc_info=True)
+            return cfg
+        bbox = mask.getbbox()
+        if not bbox:
+            return cfg
+        return max(0.0, min(30.0, _cfg_mask_absolute_mean(mask.crop(bbox))))
+
+    def _apply_layer_soft_alpha_compositing(
+        self, output: Image.Image, original_image: Image.Image, frame: InpaintFrame
+    ) -> Image.Image:
+        """Soft-edge blend the inpainted output back toward the original canvas using
+        each mask-mode layer's alpha gradient (the outer-blur feather zone).
+
+        The main inpainting mask is derived from a binary threshold of the layer alpha,
+        so the result has a hard edge at the threshold boundary.  This step re-blends:
+
+            final[x,y] = alpha[x,y] * output[x,y] + (1 - alpha[x,y]) * original[x,y]
+
+        — where alpha is the full, un-thresholded alpha from the condition image.
+
+        In the outer-blur halo (0 < alpha < 255) the inpainted content gradually
+        gives way to the original background, producing the smooth feathered edge the
+        user set via the Outer blur control.  Binary-alpha layers (no blur) are skipped
+        because the composite would be identical to what inpainting already produced.
+        """
+        if not frame.layer_conditions:
+            return output
+        import numpy as _np
+        current = output.convert("RGB")
+        original = original_image.convert("RGB")
+        conditions = sorted(frame.layer_conditions, key=lambda item: item.z_index if item.z_index is not None else 0)
+        for condition in conditions:
+            mode = condition.mode if condition.mode in {"mask", "add", "multiply", "override"} else "prompt_mix"
+            if mode != "mask":
+                continue
+            denoise = condition.denoise if condition.denoise is not None else 0.0
+            if denoise <= 0:
+                continue  # zero-denoise compositing handled by _apply_zero_denoise_layer_constraints
+            try:
+                condition_image = decode_data_url_rgba(condition.image).resize(
+                    (frame.width, frame.height), Image.Resampling.LANCZOS
+                )
+            except Exception:
+                logger.exception("Failed to decode condition image for soft-alpha compositing")
+                continue
+            alpha = condition_image.getchannel("A")
+            if not alpha.getbbox():
+                continue
+            # Only composite when the alpha has a genuine gradient (outer blur was applied).
+            # Pure binary alpha (0 or 255 only) means no feather zone — skip to avoid
+            # redundant work since inpainting already respected those hard boundaries.
+            alpha_arr = _np.asarray(alpha, dtype=_np.uint8)
+            if not bool(((alpha_arr > 0) & (alpha_arr < 255)).any()):
+                continue
+            current_arr = _np.asarray(current, dtype=_np.float32)
+            original_arr = _np.asarray(original, dtype=_np.float32)
+            alpha_f = alpha_arr.astype(_np.float32)[:, :, _np.newaxis] / 255.0
+            blended = (current_arr * alpha_f) + (original_arr * (1.0 - alpha_f))
+            covered = alpha_arr[:, :, _np.newaxis] > 0
+            current = Image.fromarray(_np.where(covered, blended, current_arr).clip(0, 255).astype(_np.uint8), "RGB")
         return current
 
     def _apply_zero_denoise_layer_constraints(self, output: Image.Image, frame: InpaintFrame) -> Image.Image:
@@ -1014,7 +1123,7 @@ class DiffusionEngine:
             mask=encode_data_url(Image.new("L", (frame.width, frame.height), 255), image_format="PNG"),
             width=frame.width,
             height=frame.height,
-            steps=min(frame.steps, 32),
+            steps=min(frame.steps, 128),
             strength=0.999,
             cfg=frame.cfg,
             sampler=frame.sampler,
@@ -1060,8 +1169,21 @@ class DiffusionEngine:
             progress(phase, max(0.0, min(1.0, value)), message, result)
 
     def _ensure_runtime(self, frame: InpaintFrame) -> None:
+        desired_compile = bool(getattr(frame, "stream_triton_compile", False))
+        compile_changed = desired_compile != self.config.compile_unet
+        self.config.compile_unet = desired_compile
+        session_directory = str(getattr(frame, "session_directory", "") or "").strip()
+        session_directory_changed = session_directory != self.config.session_directory
+        self.config.session_directory = session_directory
+        if session_directory:
+            layout = ensure_session_layout(session_directory)
+            if layout is not None:
+                self.config.stream_trt_cache_dir = str(layout["trt_cache"])
+        else:
+            self.config.stream_trt_cache_dir = os.getenv("RTD_STREAM_TRT_CACHE", "outputs/trt-engines")
         next_model = self._normalize_diffusers_model_id(frame.model_path or self.model_id)
-        if next_model and (next_model != self.model_id or self.pipe is None):
+        needs_reload_for_compile_off = compile_changed and not desired_compile and self._compile_unet_active
+        if next_model and (next_model != self.model_id or self.pipe is None or needs_reload_for_compile_off or session_directory_changed):
             old_model_id = self.model_id
             old_config_model = self.config.model_id
             self.unload_runtime()
@@ -1077,6 +1199,8 @@ class DiffusionEngine:
                 self.model_id = old_model_id
                 self.config.model_id = old_config_model
                 raise RuntimeError(f"Could not load model: {next_model}") from exc
+        elif desired_compile and not self._compile_unet_active and self.pipe is not None:
+            self._compile_unet_active = self._compile_loaded_unet()
         next_loras = tuple(path for path in frame.lora_paths if path)
         if next_loras != self.loaded_loras and self.pipe is not None:
             self._apply_loras(next_loras)
@@ -1085,11 +1209,17 @@ class DiffusionEngine:
         self._ensure_runtime(frame)
         self._apply_sampler(frame.sampler, frame.scheduler)
 
+    @property
+    def inpaint_step_info(self) -> dict:
+        """Thread-safe snapshot of the current frame's diffusion step progress."""
+        return dict(self._inpaint_step_info)
+
     def unload_runtime(self) -> None:
         logger.info("Unloading active diffusion runtime: %s", self.mode)
         self.pipe = None
         self.layer_pipe = None
         self.layer_decoder = None
+        self._compile_unet_active = False
         self.loaded_loras = ()
         self.current_sampler = None
         self._clear_realtime_stream_state()
@@ -1262,7 +1392,29 @@ class DiffusionEngine:
                 continue
             adapter_names.append(adapter_name)
         if adapter_names and hasattr(pipe, "set_adapters"):
-            pipe.set_adapters(adapter_names, adapter_weights=[1.0] * len(adapter_names))
+            # Some LoRAs (e.g. UNet-only adapters whose keys don't match the
+            # active pipeline) load without raising but never register an
+            # adapter — set_adapters would then fail with "not in the list of
+            # present adapters". Intersect with what diffusers actually
+            # registered before applying weights.
+            present: set[str] = set()
+            if hasattr(pipe, "get_list_adapters"):
+                try:
+                    for names in (pipe.get_list_adapters() or {}).values():
+                        present.update(names)
+                except Exception:
+                    present = set(adapter_names)  # fall back to optimistic
+            else:
+                present = set(adapter_names)
+            usable = [n for n in adapter_names if n in present]
+            skipped = [n for n in adapter_names if n not in present]
+            if skipped:
+                logger.warning(
+                    "LoRA(s) loaded but produced no adapter weights for this pipeline: %s",
+                    ", ".join(skipped),
+                )
+            if usable:
+                pipe.set_adapters(usable, adapter_weights=[1.0] * len(usable))
 
     @staticmethod
     def _resolve_lora_path(lora_path: str) -> Path:
@@ -1461,14 +1613,29 @@ class DiffusionEngine:
         pipe = cast(Any, self.pipe)
         if not hasattr(pipe, "scheduler") or not hasattr(pipe, "unet") or not hasattr(pipe, "vae"):
             return None
-        t_indices = [max(0, min(999, int(value))) for value in frame.stream_timestep_indices] or [32, 45]
+        # Honor stream_quality slider as an override on raw indices.
+        if frame.stream_quality is not None:
+            from ..stream import auto_t_indices
+            t_indices = auto_t_indices(frame.stream_quality)
+        else:
+            t_indices = [max(0, min(999, int(value))) for value in frame.stream_timestep_indices] or [0, 16, 32, 45]
         t_indices = t_indices[:16]
         cfg_type = frame.stream_cfg_type if frame.stream_cfg_type in {"none", "self", "initialize", "full"} else "self"
+        do_full_cfg = cfg_type == "full" and frame.cfg > 1.0
         frame_buffer_size = max(1, min(4, frame.stream_frame_buffer_size))
         needs_lcm = self._streamdiffusion_needs_lcm_lora(frame)
         signature = repr((self.model_id, self.pipeline_family, self.pipeline_kind, tuple(self.loaded_loras), self._sampling_signature(frame), self.config.stream_tiny_vae, needs_lcm, frame.prompt_b))
-        if self._latent_stream and self._latent_stream.get("signature") == signature and self._latent_stream.get("kind") == "direct-streamdiffusion":
-            return self._latent_stream
+        sig_no_cfg = repr((self.model_id, self.pipeline_family, self.pipeline_kind, tuple(self.loaded_loras), self._sampling_signature(frame, include_cfg=False), self.config.stream_tiny_vae, needs_lcm, frame.prompt_b))
+        if self._latent_stream and self._latent_stream.get("kind") == "direct-streamdiffusion":
+            if self._latent_stream.get("signature") == signature:
+                return self._latent_stream
+            # When only guidance_scale changed and do_full_cfg mode is unchanged, live-update
+            # without a full rebuild (avoids expensive warmup passes on every CFG tweak).
+            if self._latent_stream.get("sig_no_cfg") == sig_no_cfg and self._latent_stream.get("do_full_cfg") == do_full_cfg:
+                new_gs = frame.cfg if (do_full_cfg or cfg_type in {"self", "initialize"}) else 1.0
+                self._latent_stream["guidance_scale"] = new_gs
+                self._latent_stream["signature"] = signature
+                return self._latent_stream
 
         lcm_adapter = self._streamdiffusion_ensure_lcm_lora(frame) if needs_lcm else None
         device = getattr(pipe, "_execution_device", None) or torch.device(self.config.device)
@@ -1489,7 +1656,6 @@ class DiffusionEngine:
         if channels not in {latent_channels, latent_channels + 5}:
             return None
 
-        do_full_cfg = cfg_type == "full" and frame.cfg > 1.0
         encoded = pipe.encode_prompt(
             prompt=frame.prompt,
             device=device,
@@ -1557,6 +1723,7 @@ class DiffusionEngine:
         self._latent_stream = {
             "kind": "direct-streamdiffusion",
             "signature": signature,
+            "sig_no_cfg": sig_no_cfg,
             "device": device,
             "dtype": dtype,
             "scheduler": scheduler,
@@ -1862,11 +2029,15 @@ class DiffusionEngine:
         )
         if self._stream_compiled_signature == signature:
             return
+        if not _TRITON_OK:
+            return  # silently skip compile on Triton-less systems (e.g. Windows)
         try:
-            self._stream_unet_callable = torch.compile(self.pipe.unet, mode="reduce-overhead", fullgraph=False)
+            compile_mode = os.getenv("RTD_STREAM_COMPILE_MODE", os.getenv("RTD_COMPILE_MODE", "default"))
+            fullgraph = _env_flag("RTD_STREAM_COMPILE_FULLGRAPH", False)
+            self._stream_unet_callable = torch.compile(self.pipe.unet, mode=compile_mode, fullgraph=fullgraph)
             self._stream_compiled_signature = signature
             session["unet"] = self._stream_unet_callable
-            logger.info("Compiled StreamDiffusion U-Net with TorchInductor/Triton for %s", signature)
+            logger.info("Compiled StreamDiffusion U-Net with TorchInductor/Triton (mode=%s, fullgraph=%s) for %s", compile_mode, fullgraph, signature)
         except Exception:
             logger.exception("Failed to compile StreamDiffusion U-Net; continuing eager")
             self._stream_compiled_signature = signature
@@ -1983,6 +2154,149 @@ class DiffusionEngine:
         array = (image_tensor.permute(1, 2, 0).float().numpy() * 255).clip(0, 255).astype("uint8")
         return Image.fromarray(array)
 
+    def _per_layer_condition_mask(self, condition: LayerCondition, width: int, height: int) -> Image.Image | None:
+        if condition.prompt_mask:
+            try:
+                return mask_to_luma(decode_data_url(condition.prompt_mask)).resize((width, height), Image.Resampling.LANCZOS)
+            except Exception:
+                logger.exception("per_layer: failed to decode prompt mask for %s", condition.name or condition.layer_id)
+        try:
+            layer_rgba = decode_data_url_rgba(condition.image).resize((width, height), Image.Resampling.LANCZOS)
+        except Exception:
+            return None
+        alpha = layer_rgba.getchannel("A")
+        return alpha if alpha.getbbox() else None
+
+    def _per_layer_inpaint(self, image: Image.Image, mask: Image.Image, frame: InpaintFrame) -> Image.Image:
+        """Per-layer strategy: inpaint each layer in its own SDXL-resolution crop, back-to-front."""
+        from ..render.resolution import optimal_sdxl_resolution
+
+        output = image.copy()
+        padding = frame.layer_bbox_padding
+        w, h = frame.width, frame.height
+
+        # Process bottom-to-top so upper prompt regions refine over lower ones.
+        conditions = sorted(frame.layer_conditions, key=lambda item: item.z_index if item.z_index is not None else 0)
+        for layer_cond in conditions:
+            prompt = layer_cond.prompt.strip() or frame.prompt.strip()
+            if not prompt:
+                continue
+            layer_mask = self._per_layer_condition_mask(layer_cond, w, h)
+            if layer_mask is None:
+                continue
+            box = layer_mask.getbbox()
+            if box is None:
+                continue
+
+            x0, y0, x1, y1 = box
+            x0 = max(0, x0 - padding)
+            y0 = max(0, y0 - padding)
+            x1 = min(w, x1 + padding)
+            y1 = min(h, y1 + padding)
+            bw, bh = x1 - x0, y1 - y0
+            if bw < 8 or bh < 8:
+                continue
+
+            sdxl_w, sdxl_h = optimal_sdxl_resolution(bw, bh)
+
+            crop_image = output.crop((x0, y0, x1, y1)).resize((sdxl_w, sdxl_h), Image.Resampling.LANCZOS)
+            crop_mask_raw = layer_mask.crop((x0, y0, x1, y1))
+            crop_mask = crop_mask_raw.resize((sdxl_w, sdxl_h), Image.Resampling.LANCZOS)
+
+            # Any white pixel in crop_mask means "re-denoise here"; skip if mask is blank
+            import numpy as _np
+            if _np.array(crop_mask).max() == 0:
+                continue
+
+            overrides: dict = {
+                "width": sdxl_w,
+                "height": sdxl_h,
+                "prompt": prompt,
+                "negative_prompt": layer_cond.negative_prompt.strip() or frame.negative_prompt,
+                "strength": layer_cond.denoise if layer_cond.denoise is not None else frame.strength,
+                "layer_conditions": [],
+                "render_strategy": "single",
+            }
+            if layer_cond.cfg is not None:
+                overrides["cfg"] = layer_cond.cfg
+            if layer_cond.steps is not None:
+                overrides["steps"] = layer_cond.steps
+            if layer_cond.sampler:
+                overrides["sampler"] = layer_cond.sampler
+            if layer_cond.scheduler:
+                overrides["scheduler"] = layer_cond.scheduler
+
+            layer_frame = frame.model_copy(update=overrides)
+            try:
+                crop_result = self._diffusers_inpaint(crop_image, crop_mask, layer_frame)
+            except Exception:
+                logger.exception("per_layer: inpaint failed for layer %s", layer_cond.layer_id)
+                continue
+
+            result_back = crop_result.resize((bw, bh), Image.Resampling.LANCZOS).convert("RGB")
+            paste_mask = crop_mask_raw.resize((bw, bh), Image.Resampling.LANCZOS)
+            base_crop = output.crop((x0, y0, x1, y1)).convert("RGB")
+            output.paste(Image.composite(result_back, base_crop, paste_mask), (x0, y0))
+
+        return output
+
+    def _tiled_inpaint(self, image: Image.Image, mask: Image.Image, frame: InpaintFrame) -> Image.Image:
+        """Tiled strategy: inpaint SDXL-resolution grid tiles with cosine-feathered blending."""
+        import numpy as _np
+        from math import ceil
+        from ..render.resolution import optimal_sdxl_resolution, cosine_tile_weight
+
+        n = max(1, frame.tile_divisions)
+        overlap = max(0, frame.tile_overlap)
+        w, h = frame.width, frame.height
+
+        result_acc = _np.zeros((h, w, 3), dtype=_np.float32)
+        weight_acc = _np.zeros((h, w, 1), dtype=_np.float32)
+
+        tile_base_w = ceil(w / n)
+        tile_base_h = ceil(h / n)
+
+        for row in range(n):
+            for col in range(n):
+                x0 = max(0, col * tile_base_w - overlap)
+                y0 = max(0, row * tile_base_h - overlap)
+                x1 = min(w, (col + 1) * tile_base_w + overlap)
+                y1 = min(h, (row + 1) * tile_base_h + overlap)
+                tw, th = x1 - x0, y1 - y0
+                if tw < 8 or th < 8:
+                    continue
+
+                sdxl_w, sdxl_h = optimal_sdxl_resolution(tw, th)
+
+                crop_image = image.crop((x0, y0, x1, y1)).resize((sdxl_w, sdxl_h), Image.Resampling.LANCZOS)
+                crop_mask_raw = mask.crop((x0, y0, x1, y1))
+                crop_mask  = crop_mask_raw.resize((sdxl_w, sdxl_h), Image.Resampling.LANCZOS)
+
+                # Skip tiles with no masked region — no diffusion needed there
+                if _np.array(crop_mask_raw.convert("L")).max() == 0:
+                    tile_result = crop_image
+                else:
+                    tile_frame = frame.model_copy(update={
+                        "width": sdxl_w, "height": sdxl_h,
+                        "layer_conditions": [], "render_strategy": "single",
+                    })
+                    try:
+                        tile_result = self._diffusers_inpaint(crop_image, crop_mask, tile_frame)
+                    except Exception:
+                        logger.exception("tiled: inpaint failed for tile (%d,%d)", row, col)
+                        tile_result = crop_image  # fall back to unmodified crop
+
+                tile_rgb = _np.array(tile_result.resize((tw, th), Image.Resampling.LANCZOS).convert("RGB"), dtype=_np.float32)
+                weight_img = cosine_tile_weight(tw, th)
+                weight_arr = (_np.array(weight_img, dtype=_np.float32) / 255.0)[:, :, _np.newaxis]
+
+                result_acc[y0:y1, x0:x1] += tile_rgb * weight_arr
+                weight_acc[y0:y1, x0:x1] += weight_arr
+
+        weight_acc = _np.maximum(weight_acc, 1e-8)
+        result_arr = (result_acc / weight_acc).clip(0, 255).astype(_np.uint8)
+        return Image.fromarray(result_arr, "RGB")
+
     def _diffusers_inpaint(self, image: Image.Image, mask: Image.Image, frame: InpaintFrame) -> Image.Image:
         import torch
 
@@ -2002,9 +2316,17 @@ class DiffusionEngine:
             guidance_scale = 1.0
         base_inpaint_strength = max(frame.strength, min(0.999, 1 / max(1, effective_steps))) if accelerated else frame.strength
         inpaint_strength = self._realtime_inpaint_strength(frame, base_inpaint_strength)
+        effective_steps = self._scheduler_compatible_inpaint_steps(effective_steps, inpaint_strength)
+        min_viable_strength = 1.0 / max(1, effective_steps)
+        if inpaint_strength < min_viable_strength:
+            # Strength × steps would round to 0 — skip diffusion entirely.
+            logger.debug("Skipping inpaint: strength %.4f < min %.4f for %d steps", inpaint_strength, min_viable_strength, effective_steps)
+            return image.convert("RGB")
+        inpaint_strength = max(min_viable_strength, inpaint_strength)
         negative_prompt = None if guidance_scale <= 1.0 else self._negative_prompt(frame.negative_prompt)
         generator = self._realtime_generator(torch, frame)
         prompt_kwargs = self._realtime_prompt_kwargs(frame, negative_prompt, guidance_scale)
+        regional_attention = self._regional_attention_spec(frame, negative_prompt, guidance_scale)
         self._refresh_flowmatch_scheduler(self.pipe)
         with torch.inference_mode():
             if getattr(self, "pipeline_kind", "image2image") == "inpaint":
@@ -2019,6 +2341,7 @@ class DiffusionEngine:
                         "width": frame.width,
                         "height": frame.height,
                         "generator": generator,
+                        "_regional_attention": regional_attention,
                     },
                     frame,
                 ).images[0]
@@ -2033,6 +2356,7 @@ class DiffusionEngine:
                         "width": frame.width,
                         "height": frame.height,
                         "generator": generator,
+                        "_regional_attention": regional_attention,
                     },
                     frame,
                 ).images[0]
@@ -2048,10 +2372,89 @@ class DiffusionEngine:
                     "width": frame.width,
                     "height": frame.height,
                     "generator": generator,
+                    "_regional_attention": regional_attention,
                 },
                 frame,
             ).images[0]
         return Image.composite(generated.convert("RGB"), image, mask)
+
+    def _scheduler_compatible_inpaint_steps(self, requested_steps: int, strength: float) -> int:
+        steps = max(1, int(requested_steps))
+        scheduler = getattr(cast(Any, self.pipe), "scheduler", None)
+        if scheduler is None:
+            return steps
+        class_name = scheduler.__class__.__name__.lower()
+        config = getattr(scheduler, "config", None)
+        original_steps = None
+        if isinstance(config, dict):
+            original_steps = config.get("original_inference_steps")
+        elif config is not None:
+            original_steps = getattr(config, "original_inference_steps", None)
+        if original_steps is None and "lcm" in class_name:
+            original_steps = 50
+        if original_steps is None:
+            return steps
+        try:
+            max_steps = int(float(original_steps) * max(0.0, min(1.0, float(strength))))
+        except Exception:
+            return steps
+        max_steps = max(1, max_steps)
+        if steps > max_steps:
+            logger.debug("Clamping LCM inpaint steps from %d to %d for strength %.4f", steps, max_steps, strength)
+            return max_steps
+        return steps
+
+    def _regional_attention_spec(
+        self,
+        frame: InpaintFrame,
+        negative_prompt: str | None,
+        guidance_scale: float,
+    ) -> RegionalAttentionSpec | None:
+        if guidance_scale <= 1.0:
+            return None
+        pipe = cast(Any, self.pipe)
+        if pipe is None or not hasattr(pipe, "encode_prompt"):
+            return None
+        regions: list[RegionalAttentionRegion] = []
+        for condition in frame.layer_conditions:
+            prompt_text = str(condition.prompt or "").strip()
+            if not prompt_text:
+                continue
+            mask = self._regional_prompt_mask(condition, frame.width, frame.height)
+            if mask is None or not mask.getbbox():
+                continue
+            region_negative = str(condition.negative_prompt or negative_prompt or "").strip()
+            region_frame = frame.model_copy(update={"prompt": prompt_text})
+            prompt_kwargs = self._realtime_prompt_kwargs(region_frame, region_negative or None, guidance_scale)
+            prompt_embeds = prompt_kwargs.get("prompt_embeds")
+            if prompt_embeds is None:
+                continue
+            negative_embeds = prompt_kwargs.get("negative_prompt_embeds")
+            regions.append(RegionalAttentionRegion(
+                prompt_embeds=prompt_embeds,
+                negative_prompt_embeds=negative_embeds,
+                mask=mask,
+                weight=max(0.0, min(1.0, float(condition.weight or 1.0))),
+            ))
+        if not regions:
+            return None
+        return RegionalAttentionSpec(regions=tuple(regions), width=frame.width, height=frame.height)
+
+    @staticmethod
+    def _regional_prompt_mask(condition: LayerCondition, width: int, height: int) -> Image.Image | None:
+        try:
+            if condition.prompt_mask:
+                mask = decode_data_url(condition.prompt_mask).convert("L").resize((width, height), Image.Resampling.BILINEAR)
+            else:
+                rgba = decode_data_url_rgba(condition.image).resize((width, height), Image.Resampling.LANCZOS)
+                mask = rgba.getchannel("A")
+            if condition.cfg_mask:
+                cfg_mask = _cfg_mask_attention_alpha(_decode_cfg_mask_data_url(condition.cfg_mask, width, height))
+                return ImageChops.multiply(mask, cfg_mask)
+            return mask
+        except Exception:
+            logger.warning("Regional attention: failed to decode prompt mask for %s", condition.name or condition.layer_id, exc_info=True)
+            return None
 
     def _realtime_prompt_kwargs(self, frame: InpaintFrame, negative_prompt: str | None, guidance_scale: float) -> dict[str, Any]:
         pipe = cast(Any, self.pipe)
@@ -2114,10 +2517,14 @@ class DiffusionEngine:
 
         pipe = cast(Any, self.pipe)
         call_kwargs = dict(kwargs)
+        regional_attention = call_kwargs.pop("_regional_attention", None)
         saved_latents = None
         cached_latents = self._reusable_latents(frame)
         if cached_latents is not None:
             call_kwargs["latents"] = cached_latents
+
+        total_steps = int(call_kwargs.get("num_inference_steps", frame.steps) or frame.steps)
+        self._inpaint_step_info = {"step": 0, "total": total_steps, "active": True, "device": self.config.device}
 
         def on_step_end(*callback_args, **callback_kwargs):
             nonlocal saved_latents
@@ -2131,30 +2538,64 @@ class DiffusionEngine:
             latents = tensor_payload.get("latents") if isinstance(tensor_payload, dict) else None
             if isinstance(latents, torch.Tensor):
                 saved_latents = latents.detach().clone()
+            # Update step counter — diffusers passes (pipeline, step_index, timestep, cb_kwargs)
+            step_idx = next((a for a in callback_args[1:] if isinstance(a, int)), None)
+            if step_idx is not None:
+                self._inpaint_step_info = {"step": step_idx + 1, "total": total_steps, "active": True, "device": self.config.device}
             return tensor_payload if isinstance(tensor_payload, dict) else None
 
         try:
-            result = pipe(
-                **call_kwargs,
-                callback_on_step_end=on_step_end,
-                callback_on_step_end_tensor_inputs=["latents"],
-            )
-        except TypeError as exc:
-            if "latents" not in str(exc) and "callback" not in str(exc):
-                raise
-            call_kwargs.pop("latents", None)
-            try:
-                result = pipe(
-                    **call_kwargs,
-                    callback_on_step_end=on_step_end,
-                    callback_on_step_end_tensor_inputs=["latents"],
-                )
-            except TypeError as retry_exc:
-                if "callback" not in str(retry_exc):
-                    raise
-                result = pipe(**call_kwargs)
+            with regional_attention_context(pipe, regional_attention):
+                try:
+                    self._reset_realtime_scheduler_state(pipe)
+                    result = pipe(
+                        **call_kwargs,
+                        callback_on_step_end=on_step_end,
+                        callback_on_step_end_tensor_inputs=["latents"],
+                    )
+                except TypeError as exc:
+                    if "latents" not in str(exc) and "callback" not in str(exc):
+                        raise
+                    call_kwargs.pop("latents", None)
+                    try:
+                        self._reset_realtime_scheduler_state(pipe)
+                        result = pipe(
+                            **call_kwargs,
+                            callback_on_step_end=on_step_end,
+                            callback_on_step_end_tensor_inputs=["latents"],
+                        )
+                    except TypeError as retry_exc:
+                        if "callback" not in str(retry_exc):
+                            raise
+                        self._reset_realtime_scheduler_state(pipe)
+                        result = pipe(**call_kwargs)
+        finally:
+            self._inpaint_step_info = {**self._inpaint_step_info, "active": False}
         self._remember_realtime_latents(frame, saved_latents)
         return result
+
+    @staticmethod
+    def _reset_scheduler_cursor(scheduler: Any) -> None:
+        for attr in ("_step_index", "_begin_index", "step_index", "begin_index"):
+            try:
+                if hasattr(scheduler, attr):
+                    setattr(scheduler, attr, None)
+            except Exception:
+                pass
+
+    def _reset_realtime_scheduler_state(self, pipe: Any) -> None:
+        scheduler = getattr(pipe, "scheduler", None)
+        if scheduler is None:
+            return
+        class_name = scheduler.__class__.__name__
+        if "DPMSolver" in class_name:
+            try:
+                pipe.scheduler = scheduler.__class__.from_config(scheduler.config)
+                return
+            except Exception:
+                logger.debug("Could not recreate %s before realtime call; resetting cursor only", class_name, exc_info=True)
+                scheduler = getattr(pipe, "scheduler", scheduler)
+        self._reset_scheduler_cursor(scheduler)
 
     def _latent_signature(self, frame: InpaintFrame) -> tuple[object, ...]:
         return (self.model_id, self.pipeline_family, self.pipeline_kind, self._sampling_signature(frame))

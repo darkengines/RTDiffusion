@@ -331,10 +331,13 @@ def resolve_conditioning_mask(
             )
 
     denoise_arr = np.clip(denoise_arr, 0.0, 0.999)
-    # Inpaint wherever final denoise > 0; mask is derived from denoise map.
-    effective_mask = (denoise_arr > 0.001).astype(np.float32)
+    # Diffusers has one scalar ``strength`` for the whole inpaint call. Keep the
+    # highest requested denoise as that scalar, then encode lower per-pixel
+    # denoise values back into the mask intensity so RGBA denoise overrides
+    # preserve those pixels during diffusion instead of becoming full-white mask.
     effective_strength = max(float(denoise_arr.max(initial=0.0)), 0.001)
-    mask_img = Image.fromarray((effective_mask * 255.0).round().astype(np.uint8), "L")
+    effective_mask = np.where(denoise_arr > 0.001, denoise_arr / effective_strength, 0.0)
+    mask_img = Image.fromarray((np.clip(effective_mask, 0.0, 1.0) * 255.0).round().astype(np.uint8), "L")
     denoise_img = Image.fromarray((denoise_arr * 255.0).round().astype(np.uint8), "L")
     return ConditioningResult(mask=mask_img, strength=min(0.999, effective_strength), denoise_map=denoise_img)
 
@@ -346,14 +349,16 @@ def _cond_get(cond: Any, key: str, default: Any = None) -> Any:
 
 
 def _condition_alpha(cond: Any, width: int, height: int) -> np.ndarray | None:
-    image_url = _cond_get(cond, "image", "")
+    image_url = _cond_get(cond, "denoise_mask", "") or _cond_get(cond, "image", "")
     if not image_url:
         return None
     try:
         _, sep, payload = str(image_url).partition(",")
         raw = base64.b64decode(payload if sep else str(image_url))
-        rgba = Image.open(io.BytesIO(raw)).convert("RGBA").resize((width, height), Image.Resampling.LANCZOS)
-        return np.asarray(rgba.getchannel("A"), dtype=np.float32) / 255.0
+        img = Image.open(io.BytesIO(raw)).resize((width, height), Image.Resampling.LANCZOS)
+        if _cond_get(cond, "denoise_mask", ""):
+            return np.asarray(img.convert("L"), dtype=np.float32) / 255.0
+        return np.asarray(img.convert("RGBA").getchannel("A"), dtype=np.float32) / 255.0
     except Exception as exc:
         logger.warning("Conditioning mask decode failed: %s", exc)
         return None

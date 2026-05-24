@@ -3,6 +3,7 @@ export const CANVAS_CUSTOM_PROPERTIES = [
   '__preset',
   '__paintChild',
   '__parentLayerId',
+  '__isRgbaMaskLayer',
   'globalCompositeOperation',
   'name',
   'selectable',

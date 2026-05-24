@@ -7,7 +7,6 @@
       "Bash(cd /mnt/h/RTDiffusion && netstat -an 2>/dev/null | grep -E ':8000|:5173' | head -5 || echo \"ports not checked\")",
       "Read(//mnt/h/**)",
       "PowerShell($env:PYTHONIOENCODING = \"utf-8\"; Start-Process -FilePath \".\\\\.venv\\\\Scripts\\\\python.exe\" -ArgumentList \"-m\",\"uvicorn\",\"backend.app.main:app\",\"--host\",\"127.0.0.1\",\"--port\",\"8000\",\"--log-level\",\"info\" -WorkingDirectory \"H:\\\\RTDiffusion\" -RedirectStandardOutput \"H:\\\\RTDiffusion\\\\backend_stdout.log\" -RedirectStandardError \"H:\\\\RTDiffusion\\\\backend_stderr.log\" -PassThru | Select-Object Id,Name)",
-      "PowerShell($env:PYTHONIOENCODING = \"utf-8\"; & \".\\\\.venv\\\\Scripts\\\\python.exe\" probe_stream.py 2>&1)",
       "Bash(python -c \"import aiortc; print\\(aiortc.__version__\\)\")",
       "Bash(dir \"H:\\\\RTDiffusion\\\\backend\\\\app\" /b)",
       "Bash(npx vite *)",
@@ -24,7 +23,11 @@
       "Bash(python -c ' *)",
       "Bash(curl -s http://127.0.0.1:8000/health)",
       "Bash(curl -s http://localhost:5173/)",
-      "Bash(curl -s http://localhost:8000/)"
+      "Bash(curl -s http://localhost:8000/)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('backend/app/engine.py'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('backend/app/stream_pipeline.py'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "Bash(Get-ChildItem -Path \"h:\\\\RTDiffusion\" -Force)",
+      "Bash(Select-Object Name, FullName)"
     ]
   }
 }

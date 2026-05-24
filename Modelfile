@@ -1,0 +1,7 @@
+
+FROM H:\RTDiffusion\models\Nemotron-3-Nano-Omni-AEON-Ultimate-Uncensored-BF16\model-f16.gguf
+
+PARAMETER num_ctx 32768
+PARAMETER temperature 0.7
+
+TEMPLATE """{{ .Prompt }}"""

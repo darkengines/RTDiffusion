@@ -360,6 +360,32 @@ class TestResolveConditioningMask:
         assert int(arr.max()) == 255
         assert resolved.strength == pytest.approx(0.2)
 
+    def test_relative_denoise_survives_in_output_mask(self):
+        alpha = Image.new("L", (32, 32), 0)
+        alpha.paste(255, (0, 0, 16, 32))
+        rgba = Image.new("RGBA", (32, 32), (128, 64, 32, 0))
+        rgba.putalpha(alpha)
+        buf = io.BytesIO()
+        rgba.save(buf, "PNG")
+        region_url = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+        base = Image.new("L", (32, 32), 255)
+        conds = [{
+            "mode": "mask",
+            "image": region_url,
+            "weight": 1.0,
+            "denoise": 0.25,
+            "schedule": "linear",
+            "schedule_start": 0.0,
+            "schedule_end": 1.0,
+        }]
+        resolved = resolve_conditioning_mask(base, conds, 32, 32, 0.999)
+        arr = np.asarray(resolved.mask, dtype=np.uint8)
+
+        assert resolved.strength == pytest.approx(0.999)
+        assert int(arr[:, :16].mean()) == pytest.approx(64, abs=1)
+        assert int(arr[:, 16:].mean()) == 255
+
     def test_override_painters_algorithm(self):
         """Layer A (bottom, denoise=0, override, full) then Layer B (top, denoise=1.0,
         override, left half) → only left half is in mask; strength = 1.0."""

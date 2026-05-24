@@ -14,23 +14,47 @@ class ControlNetPreprocessorParams(BaseModel):
 class LayerCondition(BaseModel):
     name: str = Field(default="", max_length=200)
     layer_id: str = Field(default="", max_length=200)
+    z_index: float | None = None
+    region_id: str = Field(default="", max_length=200)
     prompt: str = Field(default="", max_length=2000)
     negative_prompt: str = Field(default="", max_length=2000)
     model_path: str | None = None
     lora_paths: list[str] = Field(default_factory=list)
     image: str
+    # Per-channel masks (see ``docs/LAYER_SYSTEM.md`` §3). All optional —
+    # when omitted, the channel falls back to the alpha of ``image``. Each
+    # value is a base64-encoded grayscale PNG data URL.
+    denoise_mask: str | None = None
+    prompt_mask: str | None = None
+    cfg_mask: str | None = None
+    color_mask: str | None = None
+    color_image: str | None = None  # RGB pixels for color compositing (§5)
+    # Binary-blob references (preferred for high-bandwidth channels). The
+    # realtime frontend streams raw PNG bytes over the WebRTC ``resources``
+    # data channel and stores the returned ID here. Backend resolves the ID
+    # against the session's blob store. Bypasses the ~33% base64 overhead.
+    denoise_mask_ref: str | None = Field(default=None, max_length=64)
+    prompt_mask_ref: str | None = Field(default=None, max_length=64)
+    cfg_mask_ref: str | None = Field(default=None, max_length=64)
+    color_mask_ref: str | None = Field(default=None, max_length=64)
     weight: float = Field(default=1.0, ge=0.0, le=4.0)
     mode: str = Field(default="mask", max_length=32)
     mask_operator: str = Field(default="add", max_length=32)
     denoise_operator: str = Field(default="replace", max_length=32)
+    cfg_operator: str = Field(default="replace", max_length=32)
+    prompt_operator: str = Field(default="concat", max_length=32)
+    negative_prompt_operator: str = Field(default="concat", max_length=32)
     cfg: float | None = Field(default=None, ge=0, le=30)
     steps: int | None = Field(default=None, ge=1, le=40)
     sampler: str | None = Field(default=None, max_length=80)
     scheduler: str | None = Field(default=None, max_length=80)
-    denoise: float | None = Field(default=None, ge=0.0, lt=1.0)
+    denoise: float | None = Field(default=None, ge=0.0, le=1.0)
     schedule: str = Field(default="auto", max_length=32)
     schedule_start: float = Field(default=0.0, ge=0.0, le=1.0)
     schedule_end: float = Field(default=1.0, ge=0.0, le=1.0)
+    blending_enabled: bool = True
+    blending_radius: int = Field(default=32, ge=-512, le=512)
+    blending_strength: float = Field(default=1.0, ge=0.0, le=4.0)
     # Auto-tagger
     auto_tag: bool = False
     auto_tag_threshold: float = Field(default=0.35, ge=0.0, le=1.0)
@@ -66,9 +90,13 @@ class PipelineNode(BaseModel):
 
 
 class InpaintFrame(BaseModel):
+    client_frame_id: int = Field(default=0, ge=0)
+    client_input_id: int = Field(default=0, ge=0)
+    scene_id: str = Field(default="", max_length=128)
     prompt: str = Field(default="", max_length=2000)
     negative_prompt: str = Field(default="", max_length=2000)
     debug_streams: bool = False
+    session_directory: str = Field(default="", max_length=2000)
     model_path: str | None = Field(default=None, max_length=1000)
     device: str | None = Field(default=None, max_length=32)
     lora_paths: list[str] = Field(default_factory=list, max_length=16)
@@ -76,8 +104,8 @@ class InpaintFrame(BaseModel):
     mask: str
     width: int = Field(default=512, ge=256, le=1536)
     height: int = Field(default=512, ge=256, le=1536)
-    steps: int = Field(default=1, ge=1, le=32)
-    strength: float = Field(default=0.38, ge=0.0, lt=1.0)
+    steps: int = Field(default=1, ge=1, le=128)
+    strength: float = Field(default=0.38, ge=0.0, le=1.0)
     cfg: float = Field(default=1.5, ge=0.0, le=30.0)
     sampler: str | None = Field(default=None, max_length=64)
     scheduler: str | None = Field(default="simple", max_length=64)
@@ -94,11 +122,15 @@ class InpaintFrame(BaseModel):
     stochastic_blur: float = Field(default=0.0, ge=0.0, le=32.0)
     stream_diffusion: bool = False
     stream_direct: bool = False
-    stream_timestep_indices: list[int] = Field(default_factory=lambda: [32, 45], max_length=16)
+    stream_timestep_indices: list[int] = Field(default_factory=lambda: [0, 16, 32, 45], max_length=16)
     stream_frame_buffer_size: int = Field(default=1, ge=1, le=4)
     stream_cfg_type: str = Field(default="self", max_length=16)
     stream_similarity_threshold: float = Field(default=0.98, ge=0.0, le=1.0)
     stream_max_skip_frames: int = Field(default=10, ge=0, le=60)
+    stream_triton_compile: bool = False
+    # When set (0..1), overrides stream_timestep_indices via an auto-picker:
+    # higher quality → more denoising steps. None = use raw indices above.
+    stream_quality: float | None = Field(default=None, ge=0.0, le=1.0)
     prompt_b: str = Field(default="", max_length=4096)
     prompt_lerp: float = Field(default=0.0, ge=0.0, le=1.0)
     transparent_background: bool = False
@@ -108,9 +140,16 @@ class InpaintFrame(BaseModel):
     transparent_alpha_blur: float = Field(default=1.5, ge=0.0, le=24.0)
     transparent_alpha_threshold: int = Field(default=10, ge=0, le=255)
     layer_conditions: list[LayerCondition] = Field(default_factory=list, max_length=16)
+    render_strategy: str = Field(default="single", max_length=32)
+    tile_divisions: int = Field(default=2, ge=1, le=8)
+    tile_overlap: int = Field(default=128, ge=0, le=512)
+    layer_bbox_padding: int = Field(default=64, ge=0, le=256)
 
 
 class InpaintResult(BaseModel):
+    client_frame_id: int = 0
+    client_input_id: int = 0
+    scene_id: str = ""
     image: str
     fps: float
     latency_ms: float

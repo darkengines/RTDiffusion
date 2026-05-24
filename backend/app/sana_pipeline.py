@@ -57,7 +57,7 @@ def _log_sig_diff(old_sig: str | None, new_sig: str, log: Any, label: str) -> No
     try:
         old_t = eval(old_sig)  # noqa: S307
         new_t = eval(new_sig)  # noqa: S307
-        fields = ("model", "device", "prompt", "negative_prompt", "cfg", "sana_steps", "dims")
+        fields = ("model", "device", "cfg", "sana_steps", "dims")
         diffs = [fields[i] for i, (a, b) in enumerate(zip(old_t, new_t)) if a != b]
         log.info("%s: sig changed — fields: %s", label, diffs or "<unknown>")
     except Exception:
@@ -118,25 +118,46 @@ class SanaSprintSession:
 
     # ── public API ─────────────────────────────────────────────────
 
-    def infer(self, image: Image.Image, strength: float = 0.7) -> Image.Image | None:
-        """Single img2img inference. Returns None if busy (non-blocking lock)."""
+    def infer(
+        self,
+        image: Image.Image,
+        strength: float = 0.7,
+        prompt: str | None = None,
+        negative_prompt: str | None = None,
+    ) -> Image.Image | None:
+        """Single img2img inference. Returns None if busy (non-blocking lock).
+
+        ``prompt`` / ``negative_prompt``, when provided, override the session's
+        baked-in defaults for this frame only. Falls back to the construction-
+        time values otherwise. This is how live prompt edits avoid a session
+        rebuild — the renderer just re-encodes per frame.
+        """
         if not self._lock.acquire(blocking=False):
             return None
         try:
-            return self._infer_inner(image, strength)
+            return self._infer_inner(image, strength, prompt, negative_prompt)
         finally:
             self._lock.release()
 
-    def _infer_inner(self, image: Image.Image, strength: float) -> Image.Image:
+    def _infer_inner(
+        self,
+        image: Image.Image,
+        strength: float,
+        prompt_override: str | None = None,
+        negative_override: str | None = None,
+    ) -> Image.Image:
         import torch
 
         image_rgb = image.convert("RGB").resize(
             (self._width, self._height), Image.LANCZOS
         )
 
+        effective_prompt = prompt_override if prompt_override is not None else self._prompt
+        effective_neg = negative_override if negative_override is not None else self._negative_prompt
+
         with torch.inference_mode():
             call_kwargs: dict[str, Any] = dict(
-                prompt=self._prompt,
+                prompt=effective_prompt,
                 image=image_rgb,
                 strength=float(strength),
                 num_inference_steps=self._num_steps,
@@ -148,7 +169,7 @@ class SanaSprintSession:
             # SanaSprintImg2ImgPipeline does not accept negative_prompt
             import inspect
             if "negative_prompt" in inspect.signature(self._pipe.__call__).parameters:
-                call_kwargs["negative_prompt"] = self._negative_prompt or None
+                call_kwargs["negative_prompt"] = effective_neg or None
             result = self._pipe(**call_kwargs)
         return result.images[0]
 
@@ -262,12 +283,13 @@ class SanaSprintSessionManager:
 # ──────────────────────────────────────────────────────────────────
 
 def _session_sig(s: dict[str, Any]) -> str:
+    """Session signature — deliberately excludes ``prompt`` and ``negative_prompt``
+    so typing them does not rebuild the pipeline. Per-frame ``infer()`` reads
+    those values live from settings."""
     model = s.get("model_path") or os.getenv("RTD_SANA_MODEL", _DEFAULT_MODEL_1_6B)
     device = s.get("device") or _default_device()
     return repr((
         model, device,
-        s.get("prompt", ""),
-        s.get("negative_prompt", ""),
         round(float(s.get("cfg", 4.5)), 3),
         int(s.get("sana_steps", 2)),
         _clamp_dims(int(s.get("width", 512)), int(s.get("height", 512))),

@@ -3,9 +3,6 @@ $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $Root
 
-$BackendPort = 8000
-$FrontendHost = '127.0.0.1'
-
 function Import-LocalEnv([string]$Path) {
   if (-not (Test-Path $Path)) { return }
   foreach ($line in Get-Content $Path) {
@@ -19,6 +16,12 @@ function Import-LocalEnv([string]$Path) {
 }
 
 Import-LocalEnv (Join-Path $Root '.env.local')
+
+if (-not $env:RTD_BACKEND_HOST) { $env:RTD_BACKEND_HOST = '127.0.0.1' }
+if (-not $env:RTD_BACKEND_PORT) { $env:RTD_BACKEND_PORT = '8000' }
+
+$BackendHost = $env:RTD_BACKEND_HOST
+$BackendPort = [int]$env:RTD_BACKEND_PORT
 
 $listenerProcessIds = Get-NetTCPConnection -LocalPort $BackendPort -State Listen -ErrorAction SilentlyContinue |
   Where-Object { $_.OwningProcess -gt 0 } |
@@ -36,4 +39,4 @@ if (-not (Test-Path $python)) {
   throw "Python venv not found at $python"
 }
 
-$backend = Start-Process -FilePath $python -ArgumentList '-m', 'uvicorn', 'app.main:app', '--app-dir', 'backend', '--host', '127.0.0.1', '--port', "$BackendPort", '--no-access-log' -WorkingDirectory $Root -PassThru
+$backend = Start-Process -FilePath $python -ArgumentList '-m', 'uvicorn', 'app.main:app', '--app-dir', 'backend', '--host', "$BackendHost", '--port', "$BackendPort", '--no-access-log' -WorkingDirectory $Root -PassThru

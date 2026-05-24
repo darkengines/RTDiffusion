@@ -16,9 +16,9 @@ from PIL import Image
 
 os.environ.setdefault("RTD_MOCK", "1")
 
-from backend.app.engine import DiffusionEngine, EngineConfig
-from backend.app.inference import DiffusersSession, inpaint_frame_to_request
-from backend.app.schemas import InpaintFrame
+from app.engine import DiffusionEngine, EngineConfig
+from app.inference import DiffusersSession, inpaint_frame_to_request
+from app.schemas import InpaintFrame
 
 
 def _png_url(img: Image.Image) -> str:
@@ -72,7 +72,7 @@ def test_adapter_caps_default_to_sdxl(mock_engine: DiffusionEngine) -> None:
 
 def test_step_requires_legacy_frame_in_hints(mock_engine: DiffusionEngine) -> None:
     """Step 4 contract: composer-driven path is not wired yet."""
-    from backend.app.inference import FrameRequest, PromptBundle, SamplerSpec
+    from app.inference import FrameRequest, PromptBundle, SamplerSpec
 
     session = DiffusersSession(mock_engine)
     bad_request = FrameRequest(
@@ -85,3 +85,50 @@ def test_step_requires_legacy_frame_in_hints(mock_engine: DiffusionEngine) -> No
     )
     with pytest.raises(RuntimeError, match="Step 4"):
         session.step(bad_request)
+
+
+def test_triton_toggle_compiles_loaded_unet(monkeypatch: pytest.MonkeyPatch) -> None:
+    import app.engine.engine as engine_mod
+    import torch
+
+    class FakePipe:
+        def __init__(self) -> None:
+            self.unet = object()
+
+    class FakeCompiled:
+        def __init__(self, model: object) -> None:
+            self._orig_mod = model
+
+    compiled: list[object] = []
+    original_compile = getattr(torch, "compile", None)
+
+    def fake_compile(model: object, **_: object) -> object:
+        compiled.append(model)
+        return FakeCompiled(model)
+
+    monkeypatch.setattr(engine_mod, "_TRITON_OK", True)
+    monkeypatch.setattr(torch, "compile", fake_compile, raising=False)
+    try:
+        engine = DiffusionEngine(EngineConfig(device="cpu"))
+        engine.pipe = FakePipe()
+        engine.model_id = "loaded-model"
+        engine.config.model_id = "loaded-model"
+        engine.config.compile_unet = False
+        engine._compile_unet_active = False
+
+        frame = _make_frame()
+        frame.model_path = "loaded-model"
+        frame.stream_triton_compile = True
+
+        engine._ensure_runtime(frame)
+
+        assert compiled
+        assert engine._compile_unet_active is True
+        assert engine.config.compile_unet is True
+        assert isinstance(engine.pipe.unet, FakeCompiled)
+        assert engine.compile_status()["requested"] is True
+        assert engine.compile_status()["active"] is True
+        assert engine.compile_status()["unet_compiled"] is True
+    finally:
+        if original_compile is not None:
+            monkeypatch.setattr(torch, "compile", original_compile, raising=False)

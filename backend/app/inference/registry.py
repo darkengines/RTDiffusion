@@ -74,7 +74,9 @@ def _streamdiffusion_caps() -> RendererCaps:
         motion_transform=True,
         video_layer=True,
         auto_tag=True,
-        regional_prompts=False,  # streaming path does not currently apply regional prompts per-frame
+        # Regional prompts via per-region infer passes (composition.LAYERED_PASS).
+        # Per-region CFG and schedule are NOT supported (single batched timestep set).
+        regional_prompts=True,
         blend_modes=frozenset(("normal",)),
         max_layers=8,
         max_resolution=1024,
@@ -83,7 +85,8 @@ def _streamdiffusion_caps() -> RendererCaps:
         transport="webrtc",
         runtime="internal-streamdiffusion" if native else "diffusers-fallback",
         native=native,
-        notes="Persistent StreamDiffusion-style denoising batch over WebRTC.",
+        notes="Persistent StreamDiffusion batch over WebRTC. Regional prompts via "
+              "multi-pass; per-region CFG and per-region schedule not supported.",
     )
 
 
@@ -97,7 +100,11 @@ def _sana_caps() -> RendererCaps:
         motion_transform=False,
         video_layer=True,
         auto_tag=False,
-        regional_prompts=False,
+        # Regional prompts are degraded to structured "Background/Midground/
+        # Foreground" sections with English spatial locators (no native
+        # per-token attention masking yet). Per-region CFG and schedule are
+        # not supported — composition emits warnings for those.
+        regional_prompts=True,
         blend_modes=frozenset(("normal",)),
         max_layers=4,
         max_resolution=1024,
@@ -106,7 +113,8 @@ def _sana_caps() -> RendererCaps:
         transport="webrtc",
         runtime="sana",
         native=True,
-        notes="SANA linear-attention sampler.",
+        notes="SANA linear-attention sampler. Regional prompts via structured "
+              "LLM-style sections; per-region CFG/schedule not supported.",
     )
 
 

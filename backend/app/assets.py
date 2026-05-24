@@ -45,12 +45,82 @@ DEFAULT_MODEL_ID = "diffusers/stable-diffusion-xl-1.0-inpainting-0.1"
 def list_assets() -> dict[str, list[dict[str, str | int | bool]]]:
     models = _model_assets()
     video_models = _video_model_assets()
-    loras = [_describe(path, preferred=False) for path in _scan(LORA_DIRS, LORA_SUFFIXES)]
+    # Discover LoRAs in the configured/default LORA_DIRS *and* alongside every
+    # discovered model — this is the ComfyUI convention (a single tree with
+    # sibling ``loras/`` and ``checkpoints/`` directories). Without this, a user
+    # whose models are at ``D:\comfyui\comfy\models\checkpoints\*.safetensors``
+    # would see "No LoRAs available" even when ``loras/`` exists right next to
+    # the checkpoints — only because that path isn't in ``RTD_LORA_DIRS``.
+    lora_dirs = list(LORA_DIRS) + _lora_dirs_from_models(models)
+    lora_candidates = _scan(_dedupe_paths(lora_dirs), LORA_SUFFIXES)
+    # Anything we already classified as a model must not also appear as a LoRA.
+    model_paths = {_resolve_str(item.get("path")) for item in models}
+    loras = [
+        _describe(path, preferred=False)
+        for path in lora_candidates
+        if _resolve_str(str(path)) not in model_paths
+    ]
     return {
         "models": sorted(models, key=lambda item: (not bool(item["preferred"]), str(item["name"]).lower())),
         "video_models": sorted(video_models, key=lambda item: (not bool(item["preferred"]), str(item["name"]).lower())),
-        "loras": sorted(loras, key=lambda item: str(item["name"]).lower()),
+        "loras": sorted(_dedupe_assets(loras), key=lambda item: str(item["name"]).lower()),
     }
+
+
+def _lora_dirs_from_models(models: list[dict[str, str | int | bool]]) -> list[Path]:
+    """Derive plausible LoRA directories from the discovered models.
+
+    We look ONLY at sibling directories named ``loras`` / ``Lora`` / ``lora`` /
+    ``LoRA`` next to the model file or its parent (i.e. the ComfyUI layout with
+    ``checkpoints/`` and ``loras/`` siblings, or the Automatic1111 layout with
+    ``models/Stable-diffusion/`` and ``models/Lora/`` siblings).
+
+    We deliberately do NOT add the model's own parent directory — without a
+    way to distinguish a model file from a LoRA file at the path level
+    (both are ``.safetensors``), the same files would get classified as both.
+    Users who keep LoRAs in the same folder as their models must add that
+    folder to ``RTD_LORA_DIRS`` explicitly.
+    """
+    candidates: list[Path] = []
+    for item in models:
+        raw = str(item.get("path") or "")
+        if not raw:
+            continue
+        model_path = Path(raw).expanduser()
+        if not model_path.exists() or not model_path.is_file():
+            continue
+        parent = model_path.parent
+        ancestors: list[Path] = [parent]
+        if parent.parent != parent:
+            ancestors.append(parent.parent)
+        for ancestor in ancestors:
+            for name in ("loras", "Lora", "lora", "LoRA"):
+                sibling = ancestor / name
+                if sibling.exists() and sibling.is_dir():
+                    candidates.append(sibling)
+    return candidates
+
+
+def _dedupe_paths(paths: list[Path]) -> list[Path]:
+    seen: set[str] = set()
+    out: list[Path] = []
+    for p in paths:
+        key = _resolve_str(str(p))
+        if key not in seen:
+            seen.add(key)
+            out.append(p)
+    return out
+
+
+def _resolve_str(value: object | None) -> str:
+    """Best-effort canonical string for a path. Falls back to the raw string
+    when the path is not resolvable (e.g. an HF model ID)."""
+    if not value:
+        return ""
+    try:
+        return str(Path(str(value)).expanduser().resolve())
+    except (OSError, RuntimeError):
+        return str(value)
 
 
 def default_model_path() -> str:
