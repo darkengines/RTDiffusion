@@ -175,14 +175,18 @@ export async function rtcStart(): Promise<{ pc_id: string }> {
   return resp.json() as Promise<{ pc_id: string }>
 }
 
-export async function rtcOffer(offer: RTCSessionDescriptionInit, sessionId?: string): Promise<{ pc_id: string; answer: RTCSessionDescriptionInit }> {
+export async function rtcOffer(
+  offer: RTCSessionDescriptionInit,
+  sessionId?: string,
+  outputTransport: 'video' | 'image' = 'video',
+): Promise<{ pc_id: string; answer: RTCSessionDescriptionInit; output_transport?: 'video' | 'image' }> {
   const resp = await fetch(backendUrl('/api/rtc/offer'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ offer, session_id: sessionId }),
+    body: JSON.stringify({ offer, session_id: sessionId, output_transport: outputTransport }),
   })
   if (!resp.ok) throw new Error(`RTC offer failed: ${resp.status} ${await resp.text()}`)
-  return resp.json() as Promise<{ pc_id: string; answer: RTCSessionDescriptionInit }>
+  return resp.json() as Promise<{ pc_id: string; answer: RTCSessionDescriptionInit; output_transport?: 'video' | 'image' }>
 }
 
 export function rtcStreamUrl(pcId: string): string {
@@ -281,38 +285,6 @@ export async function fetchMotionVideoSegment(videoUrl: string): Promise<ArrayBu
   const response = await fetch(backendUrl(videoUrl, { t: String(Date.now()) }))
   if (!response.ok) return null
   return response.arrayBuffer()
-}
-
-// ── SANA video generation ────────────────────────────────────────────────────
-
-export interface SanaVideoTaskRequest {
-  model: string
-  prompt: string
-  negative_prompt?: string
-  image: string
-  num_frames: number
-  guidance_scale: number
-  num_inference_steps: number
-  width: number
-  height: number
-}
-
-export async function postSanaVideoTask(request: SanaVideoTaskRequest): Promise<{ task_id: string }> {
-  const resp = await fetch(backendUrl('/sana/video/tasks'), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(request),
-  })
-  if (!resp.ok) throw new Error(await resp.text())
-  return resp.json() as Promise<{ task_id: string }>
-}
-
-export function watchSanaVideoTask(taskId: string): WebSocket {
-  return new WebSocket(backendWsUrl(`/ws/sana/video/${taskId}`))
-}
-
-export function sanaVideoDownloadUrl(downloadPath: string): string {
-  return backendUrl(downloadPath)
 }
 
 // ── Generic image fetch ──────────────────────────────────────────────────────

@@ -28,11 +28,9 @@ from ..schemas import LayerTaskProgress, MotionTaskProgress
 
 layer_tasks: dict[str, LayerTaskProgress] = {}
 motion_tasks: dict[str, MotionTaskProgress] = {}
-sana_video_tasks: dict[str, dict] = {}
 
 layer_task_lock = threading.Lock()
 motion_task_lock = threading.Lock()
-sana_task_lock = threading.Lock()
 
 # ── System tasks ───────────────────────────────────────────────────
 

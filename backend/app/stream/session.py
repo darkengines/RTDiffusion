@@ -1,33 +1,24 @@
 """StreamSession — one continuous StreamDiffusion inpainting session."""
 from __future__ import annotations
 
-import gc
 import hashlib
-import logging
 import threading
-import time
 import os
 from typing import Any
 
 from PIL import Image
 
 from .helpers import (
-    _TINY_VAE_SD15,
-    _TINY_VAE_SDXL,
-    _TRITON_OK,
     _build_added_cond,
     _compute_scalings,
     _encode_prompt,
     _frame_embeds,
     _is_cuda,
     _load_vae,
-    _match_batch,
     _predict_x0,
     _update_mask_latents,
     _vae_encode,
-    auto_t_indices,
     logger,
-    resolve_t_indices,
 )
 
 
@@ -354,10 +345,9 @@ class StreamSession:
         control_image   — optional preprocessed ControlNet conditioning image.
                           Only used if the session was built with a CN model.
         cn_scale        — ControlNet conditioning scale for this frame.
-        Returns RGB PIL image, or None if another inference is in progress.
+        Returns RGB PIL image.
         """
-        if not self._infer_lock.acquire(blocking=False):
-            return None  # concurrent connection — skip this frame
+        self._infer_lock.acquire()
 
         try:
             return self._infer_inner(image, mask, prompt_lerp, prompt_override,

@@ -113,12 +113,13 @@ function _saveOptions() {
     streamTimestepIndices: st.timestepIndices,
     streamFrameBufferSize: st.frameBufferSize,
     streamCfgType: st.cfgType,
-    streamSimilarityThreshold: st.similarityThreshold,
-    streamMaxSkipFrames: st.maxSkipFrames,
     streamRuntimePreset: st.runtimePreset,
     streamMotionMode: st.motionMode,
     streamMotionIntensity: st.motionIntensity,
     streamMotionSpeed: st.motionSpeed,
+    streamTritonCompile: st.tritonCompile,
+    streamVaeMode: st.vaeMode,
+    streamOutputTransport: st.outputTransport,
     scenePanelTab: st.scenePanelTab,
     selectedEntity: l.selectedEntity,
     sceneMaskNegated: l.maskNegated,
@@ -206,12 +207,13 @@ function _loadOptions() {
     if (opts.streamTimestepIndices !== undefined) $stream.setKey('timestepIndices', opts.streamTimestepIndices)
     if (opts.streamFrameBufferSize !== undefined) $stream.setKey('frameBufferSize', opts.streamFrameBufferSize)
     if (opts.streamCfgType !== undefined) $stream.setKey('cfgType', opts.streamCfgType)
-    if (opts.streamSimilarityThreshold !== undefined) $stream.setKey('similarityThreshold', opts.streamSimilarityThreshold)
-    if (opts.streamMaxSkipFrames !== undefined) $stream.setKey('maxSkipFrames', opts.streamMaxSkipFrames)
     if (opts.streamRuntimePreset !== undefined) $stream.setKey('runtimePreset', opts.streamRuntimePreset)
     if (opts.streamMotionMode !== undefined) $stream.setKey('motionMode', opts.streamMotionMode)
     if (opts.streamMotionIntensity !== undefined) $stream.setKey('motionIntensity', opts.streamMotionIntensity)
     if (opts.streamMotionSpeed !== undefined) $stream.setKey('motionSpeed', opts.streamMotionSpeed)
+    if (opts.streamTritonCompile !== undefined) $stream.setKey('tritonCompile', opts.streamTritonCompile)
+    if (opts.streamVaeMode !== undefined) $stream.setKey('vaeMode', opts.streamVaeMode)
+    if (opts.streamOutputTransport !== undefined) $stream.setKey('outputTransport', opts.streamOutputTransport)
     if (opts.scenePanelTab !== undefined) $stream.setKey('scenePanelTab', opts.scenePanelTab)
 
     if (opts.leftPanelWidth !== undefined) $ui.setKey('leftPanelWidth', opts.leftPanelWidth)
@@ -261,13 +263,12 @@ export class RtdAppShell extends LitElement {
       realtimeDevice: stream.realtimeDevice,
       sessionDirectory: stream.sessionDirectory,
       runtimePreset: stream.runtimePreset,
+      vaeMode: stream.vaeMode,
       timestepIndices: stream.timestepIndices,
       frameBufferSize: stream.frameBufferSize,
       cfgType: stream.cfgType,
-      similarityThreshold: stream.similarityThreshold,
-      maxSkipFrames: stream.maxSkipFrames,
+      outputTransport: stream.outputTransport,
       tritonCompile: stream.tritonCompile,
-      sanaSteps: stream.sanaSteps,
       debugStreamsEnabled: stream.debugStreamsEnabled,
     })
   }
@@ -310,9 +311,9 @@ export class RtdAppShell extends LitElement {
       stream_timestep_indices: st.timestepIndices.split(',').map(Number).filter((n: number) => !isNaN(n)),
       stream_frame_buffer_size: st.frameBufferSize,
       stream_cfg_type: st.cfgType,
-      stream_similarity_threshold: st.similarityThreshold,
-      stream_max_skip_frames: st.maxSkipFrames,
       stream_triton_compile: st.tritonCompile,
+      stream_vae_mode: st.vaeMode,
+      output_transport: st.outputTransport,
     }
   }
 
@@ -645,9 +646,6 @@ export class RtdAppShell extends LitElement {
       { value: 'sdxl', label: 'SDXL' },
       { value: 'z-image', label: 'Z-Image' },
       { value: 'streamdiffusion', label: 'StreamDiffusion' },
-      { value: 'sana', label: 'SANA' },
-      { value: 'causal-forcing', label: 'Causal-Forcing' },
-      { value: 'fastvideo', label: 'WAN Video' },
     ]
 
     return html`<div class="shell" style="--left-w:${leftW}px; --right-w:${rightW}px">

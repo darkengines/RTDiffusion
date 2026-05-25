@@ -9,8 +9,6 @@ import {
   watchMotionTask as openMotionSocket,
   fetchMotionFrameBlob,
   fetchMotionVideoSegment,
-  postSanaVideoTask,
-  watchSanaVideoTask as openSanaSocket,
 } from './api'
 import type { MotionClip, MotionTaskProgress } from '../types'
 
@@ -170,7 +168,7 @@ export async function startMotionGeneration(sourceImage: string, modelOverride?:
   if (!(await _ensureVideoBackendReady(model))) return
 
   const runId = ++_motionRunId
-  const singleClip = model === 'fastvideo'
+  const singleClip = false
   clearMotionPlayback()
   $motion.setKey('activeFrame', sourceImage)
   const useStream = singleClip ? false : await _openVideoStream()
@@ -221,43 +219,4 @@ export async function startMotionGeneration(sourceImage: string, modelOverride?:
       _motionTaskSocket = undefined
     }
   }
-}
-
-// ── SANA video ────────────────────────────────────────────────────────────────
-
-export async function startSanaVideoTask(canvasImage: string): Promise<void> {
-  const st = $motion.get()
-  const scene = $scene.get()
-  $motion.setKey('sanaVideoTask', { status: 'queued', progress: 0, phase: 'Queuing…' })
-  try {
-    const { task_id } = await postSanaVideoTask({
-      model: st.sanaVideoModel,
-      prompt: scene.prompt,
-      negative_prompt: scene.negativePrompt,
-      image: canvasImage,
-      num_frames: st.sanaVideoNumFrames,
-      guidance_scale: st.sanaVideoGuidance,
-      num_inference_steps: st.sanaVideoSteps,
-      width: scene.stageWidth,
-      height: scene.stageHeight,
-    })
-    $motion.setKey('sanaVideoTaskId', task_id)
-    await _pollSanaTask(task_id)
-  } catch (err) {
-    $motion.setKey('sanaVideoTask', { status: 'error', progress: 0, error: String(err) })
-  }
-}
-
-async function _pollSanaTask(taskId: string): Promise<void> {
-  await new Promise<void>((resolve) => {
-    const ws = openSanaSocket(taskId)
-    ws.onmessage = (ev) => {
-      if ($motion.get().sanaVideoTaskId !== taskId) { ws.close(); resolve(); return }
-      const data = JSON.parse(ev.data) as Record<string, unknown>
-      $motion.setKey('sanaVideoTask', data)
-      if (data.status === 'complete' || data.status === 'done' || data.status === 'error') { ws.close(); resolve() }
-    }
-    ws.onerror = () => resolve()
-    ws.onclose = () => resolve()
-  })
 }

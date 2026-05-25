@@ -18,7 +18,7 @@ endpoint:
   • ``GET  /api/rtc/{id}/stream``   → SSE stream emits status events
   • ``DELETE /api/rtc/peers/{id}``  → session cleanup
 
-Both managers (StreamSession + Sana) are monkey-patched to return a stub that
+The stream session manager is monkey-patched to return a stub that
 synthesises a constant-colour PIL image, so the full code path between the
 HTTP layer and the inference call is exercised without a GPU.
 
@@ -29,13 +29,11 @@ defined any layer (the very first frame after a fresh session start).
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import io
 import sys
 import time
-import types
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -90,10 +88,8 @@ def client():
             pass
 
     stub_stream = _StubManager()
-    stub_sana = _StubManager()
 
-    with patch.object(rtc_session, "_shared_session_manager", stub_stream), \
-         patch.object(rtc_session, "_shared_sana_manager", stub_sana):
+    with patch.object(rtc_session, "_shared_session_manager", stub_stream):
         # Also rebind the symbols on InpaintSession that capture managers at __init__.
         # The InpaintSession instance reads ``_shared_session_manager`` lazily so the
         # patch above is sufficient — verified by inspecting its constructor.

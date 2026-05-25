@@ -3,7 +3,6 @@ import os
 from importlib import metadata
 
 from .inference.registry import all_caps as _all_backend_caps
-from .motion import missing_motion_adapter_message, motion_adapter_configured
 
 
 def renderer_capabilities() -> dict[str, object]:
@@ -45,8 +44,6 @@ def renderer_capabilities() -> dict[str, object]:
                 xformers_available,
                 tensorrt_available,
             ),
-            "causal-forcing": _external_motion_capability("causal-forcing-1step", "Causal-Forcing"),
-            "fastvideo": _external_motion_capability("fastvideo", "WAN/FastVideo"),
         },
     }
     _merge_backend_caps(payload)
@@ -100,21 +97,6 @@ def _streamdiffusion_capability(package_native: bool, internal_native: bool, dir
         "requirements": ["compatible StreamDiffusion install", "persistent worker", "warmup", "stream batch", "tiny VAE"],
         "accelerators": {"xformers": xformers, "tensorrt": tensorrt, "direct_stream_enabled": direct_enabled},
     }
-
-
-def _external_motion_capability(model: str, label: str) -> dict[str, object]:
-    configured = motion_adapter_configured(model)
-    return {
-        "configured": configured,
-        "native": False,
-        "streamable": configured,
-        "realtime": False,
-        "runtime": "external-command",
-        "transport": "task-websocket-video" if configured else "none",
-        "message": f"{label} external runtime configured." if configured else missing_motion_adapter_message(model),
-        "requirements": [] if configured else ["external runtime command/env"],
-    }
-
 
 def _module_available(name: str) -> bool:
     return importlib.util.find_spec(name) is not None

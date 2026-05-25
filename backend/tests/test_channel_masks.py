@@ -17,7 +17,6 @@ from PIL import Image
 from app.composition import (
     CFG_HI,
     Layer,
-    NumericOp,
     Region,
     RendererSupport,
     Scene,

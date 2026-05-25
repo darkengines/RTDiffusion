@@ -62,8 +62,7 @@ def client():
             pass
 
     from unittest.mock import patch
-    with patch.object(rtc_session, "_shared_session_manager", _StubManager()), \
-         patch.object(rtc_session, "_shared_sana_manager", _StubManager()):
+    with patch.object(rtc_session, "_shared_session_manager", _StubManager()):
         with TestClient(_main.app) as c:
             yield c
 

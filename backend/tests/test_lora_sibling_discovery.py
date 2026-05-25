@@ -19,10 +19,8 @@ model's sibling/parent directories.
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
-import pytest
 
 
 def _make_safetensors(path: Path, *, contents: bytes = b"\x00\x00\x00\x00") -> None:

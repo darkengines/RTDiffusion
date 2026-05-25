@@ -1,5 +1,5 @@
 import { map } from 'nanostores'
-import type { ScenePanelTab, StreamMotionMode, StreamRuntimePreset } from '../types'
+import type { ScenePanelTab, StreamMotionMode, StreamOutputTransport, StreamRuntimePreset, StreamTimingMap, StreamVaeMode } from '../types'
 
 export type StreamStatus = 'offline' | 'connecting' | 'streaming' | 'error' | 'backend unavailable' | string
 
@@ -20,13 +20,14 @@ export interface StreamState {
   timestepIndices: string
   frameBufferSize: number
   cfgType: string
-  similarityThreshold: number
-  maxSkipFrames: number
   motionMode: StreamMotionMode
   motionIntensity: number
   motionSpeed: number
+  vaeMode: StreamVaeMode
+  outputTransport: StreamOutputTransport
+  outputTimings: StreamTimingMap
+  outputTimingsExpanded: boolean
   tritonCompile: boolean
-  sanaSteps: number
   debugStreamsEnabled: boolean
   debugChannelNames: string[]
   debugMosaicMode: boolean
@@ -50,13 +51,14 @@ export const $stream = map<StreamState>({
   timestepIndices: '16,32',
   frameBufferSize: 1,
   cfgType: 'self',
-  similarityThreshold: 0.98,
-  maxSkipFrames: 0,
   motionMode: 'none',
   motionIntensity: 0.35,
   motionSpeed: 1,
+  vaeMode: 'auto',
+  outputTransport: 'video',
+  outputTimings: {},
+  outputTimingsExpanded: false,
   tritonCompile: false,
-  sanaSteps: 2,
   debugStreamsEnabled: false,
   debugChannelNames: [],
   debugMosaicMode: true,

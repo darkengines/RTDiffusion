@@ -313,10 +313,14 @@ def resolve_conditioning_mask(
         covered = influence > 0.01
 
         if mode in ("override", "replace"):
-            # Painter's algorithm: hard overwrite denoise in covered region.
-            # Later layers win — so Layer B (top) overrides Layer A (bottom) in
-            # B's masked area even if A set that region to 0.
-            denoise_arr = np.where(covered, target, denoise_arr)
+            # Alpha-weighted replacement: parent/top layer alpha is a blend
+            # weight over prior layers, not a hard overwrite at any non-zero
+            # coverage. Fully opaque still replaces, feathered alpha blends.
+            denoise_arr = np.where(
+                covered,
+                denoise_arr * (1.0 - influence) + target * influence,
+                denoise_arr,
+            )
         elif mode == "add":
             denoise_arr = np.clip(
                 denoise_arr + np.where(covered, influence * target, 0.0), 0.0, 0.999

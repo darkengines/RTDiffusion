@@ -37,6 +37,7 @@ import type {
   ToolMode,
   VideoFpsMode,
   ViewportTarget,
+  StreamTimingMap,
 } from '../../types'
 import {
   COLOR_PLANNER_MODES,
@@ -51,7 +52,7 @@ import { $canvas } from '../../stores/canvas.store'
 import { $scene } from '../../stores/scene.store'
 import { $stream } from '../../stores/stream.store'
 import { serializeChannelRefs } from '../../services/mask-blob.service'
-import { getDebugSurfaces, getSceneResourceDebugData, getWebRtcOutputMediaStream, registerDebugCanvasSurface, registerWebRtcResourceMediaTrack, unregisterDebugSurface, type DebugSurface } from '../../services/stream.service'
+import { getDebugSurfaceStream, getDebugSurfaces, getSceneResourceDebugData, getWebRtcOutputMediaStream, registerDebugCanvasSurface, registerWebRtcResourceMediaTrack, requestDebugSurfaceFrame, unregisterDebugSurface, type DebugSurface } from '../../services/stream.service'
 
 const CFG_MASK_F32_MIME = 'application/x-rtd-mask-f32'
 const CFG_MASK_F32_MAGIC = 'RTF1'
@@ -113,6 +114,7 @@ export class RtdCanvasEditor extends LitElement {
   @query('#mask-preview-canvas') private maskPreviewCanvasElement!: HTMLCanvasElement
   @query('#input-capture-canvas') private inputCaptureCanvasElement?: HTMLCanvasElement
   @query('#editor-overlay') private editorOverlayCanvas?: HTMLCanvasElement
+  @query('#signal-output-video') private signalOutputVideoElement?: HTMLVideoElement
   @query('.stage') private stageElement!: HTMLElement
   @query('.canvas-pane.work-pane') private inputPaneElement!: HTMLElement
 
@@ -156,7 +158,10 @@ export class RtdCanvasEditor extends LitElement {
   @state() private editorDest: EditorDest = 'paint'
   @state() private inputOverlayVisible = true
   @state() private outputOverlayVisible = true
+  @state() private outputTimings: StreamTimingMap = {}
+  @state() private outputTimingsExpanded = false
   @state() private selectedOutputSignal = 'output'
+  @state() private signalPickerOpen = false
   @state() private resourceDebugVersion = 0
   @state() private selectionRect?: SelectionRect
   @state() private layerGenerationSteps = 24
@@ -242,6 +247,9 @@ export class RtdCanvasEditor extends LitElement {
   private lastLayerConditionTopologySignature = ''
   private layerMediaSurfaces = new Map<string, LayerMediaSurface>()
   private layerMediaRefreshRaf?: number
+  private drawSignalRefreshRaf?: number
+  private upperCanvasLiveInputRaf?: number
+  private upperCanvasLiveInputPending = false
   private layerMediaDirtyIds = new Set<string>()
   private layerPreviewCache = new Map<string, string>()
   private inputCanvasMediaStream?: MediaStream
@@ -249,7 +257,7 @@ export class RtdCanvasEditor extends LitElement {
   private inputCanvasMediaSource?: HTMLCanvasElement
   private inputCanvasCaptureCanvas?: HTMLCanvasElement
   private inputCanvasCaptureRaf?: number
-  private readonly inputCanvasCaptureFps = 12
+  private readonly inputCanvasCaptureFps = 30
   private inputCanvasMediaCaptureFps = 0
   private inputCanvasMediaRegistered = false
   private streamOutputBackingCanvas?: HTMLCanvasElement
@@ -258,6 +266,7 @@ export class RtdCanvasEditor extends LitElement {
   private streamOutputFrameSeq = 0
   private signalInspectVideo?: HTMLVideoElement
   private signalInspectRaf?: number
+  private signalInspectCanvasStreams = new Map<string, { canvas: HTMLCanvasElement; stream: MediaStream; track?: MediaStreamTrack }>()
   private pendingRgbaPlacementId = ''
   private pendingRgbaPlacementLayerId = ''
   private transformOverlayRaf?: number
@@ -394,6 +403,8 @@ export class RtdCanvasEditor extends LitElement {
       if (s.outputImage !== this.outputImage) this.outputImage = s.outputImage
       if (s.outputImageNonce !== this.outputImageNonce) this.outputImageNonce = s.outputImageNonce
       if (s.realtimeVideoActive !== this.realtimeVideoActive) this.realtimeVideoActive = s.realtimeVideoActive
+      if (s.outputTimings !== this.outputTimings) this.outputTimings = s.outputTimings
+      if (s.outputTimingsExpanded !== this.outputTimingsExpanded) this.outputTimingsExpanded = s.outputTimingsExpanded
       if (s.isStreaming) {
         this.ensureInputCanvasMediaTrack()
         this.syncLayerMediaSurfaces()
@@ -413,6 +424,7 @@ export class RtdCanvasEditor extends LitElement {
     if (this.maskStreamUpdateRaf !== undefined) window.cancelAnimationFrame(this.maskStreamUpdateRaf)
     if (this.transformOverlayRaf !== undefined) window.cancelAnimationFrame(this.transformOverlayRaf)
     if (this.layerMediaRefreshRaf !== undefined) window.cancelAnimationFrame(this.layerMediaRefreshRaf)
+    if (this.drawSignalRefreshRaf !== undefined) window.cancelAnimationFrame(this.drawSignalRefreshRaf)
     if (this.streamOutputVideoRaf !== undefined) window.cancelAnimationFrame(this.streamOutputVideoRaf)
     if (this.signalInspectRaf !== undefined) window.cancelAnimationFrame(this.signalInspectRaf)
     this.liveStreamUpdateScheduled = false
@@ -421,10 +433,12 @@ export class RtdCanvasEditor extends LitElement {
     this.maskStreamUpdateRaf = undefined
     this.transformOverlayRaf = undefined
     this.layerMediaRefreshRaf = undefined
+    this.drawSignalRefreshRaf = undefined
     this.streamOutputVideoRaf = undefined
     this.signalInspectRaf = undefined
     if (this.streamOutputVideo) this.streamOutputVideo.srcObject = null
     if (this.signalInspectVideo) this.signalInspectVideo.srcObject = null
+    this.disposeSignalInspectCanvasStreams()
     this.disposeLayerMediaSurfaces()
     this.stopInputCanvasMediaTrack()
     unregisterDebugSurface('input/frame/canvas')
@@ -460,8 +474,11 @@ export class RtdCanvasEditor extends LitElement {
       this.syncVisibleStreamOutputCanvas()
       this.attachStreamOutputVideo(getWebRtcOutputMediaStream())
     }
-    if (changedProperties.has('selectedOutputSignal') || changedProperties.has('stageWidth') || changedProperties.has('stageHeight')) {
-      this.scheduleSignalInspectionDraw()
+    if (changedProperties.has('selectedOutputSignal') || changedProperties.has('resourceDebugVersion') || changedProperties.has('stageWidth') || changedProperties.has('stageHeight')) {
+      this.syncSignalInspectionSurface()
+    }
+    if (changedProperties.has('signalPickerOpen') || changedProperties.has('selectedOutputSignal') || changedProperties.has('resourceDebugVersion')) {
+      this.syncSignalPickerPreviewStreams()
     }
   }
 
@@ -567,10 +584,19 @@ export class RtdCanvasEditor extends LitElement {
               <strong>Output</strong>
               <span>${this.stageWidth} x ${this.stageHeight}</span>
               <span>${Math.round(this.outputZoom * 100)}%</span>
-              <select class="signal-select" title="Inspect signal" .value=${this.selectedOutputSignal} @change=${this.selectOutputSignal}>
-                ${this.outputSignalOptions().map((name) => html`<option value=${name}>${name}</option>`)}
-              </select>
+              <div class="output-overlay-tools">
+                ${this.renderOutputTimingToggle()}
+                <button
+                  class=${this.signalPickerOpen ? 'signal-grid-toggle active' : 'signal-grid-toggle'}
+                  title="Open signal grid"
+                  @click=${this.toggleSignalPicker}
+                >
+                  ${this.selectedOutputSignal === 'output' ? 'Signals' : this.selectedOutputSignal}
+                </button>
+              </div>
             </div>
+            ${this.renderOutputTimingPanel()}
+            ${this.signalPickerOpen ? this.renderSignalPickerGrid() : null}
             <div class="work-surface"
               @wheel=${(event: WheelEvent) => this.zoomViewport(event, 'output')}
               @pointerdown=${this.startViewportPan}
@@ -580,15 +606,16 @@ export class RtdCanvasEditor extends LitElement {
             >
               <div class="stage-wrap">
                 <div class=${this.outputPreviewClass()} style=${this.outputPreviewStyle()}>
-                  ${this.selectedOutputSignal !== 'output'
-                    ? html`<canvas id="signal-output-canvas" class="signal-output-canvas" aria-label=${`signal ${this.selectedOutputSignal}`}></canvas>`
-                    : this.realtimeVideoActive
-                    ? html`<canvas id="stream-output-canvas" class="stream-output-video" aria-label="realtime output"></canvas><video id="stream-output-video" class="stream-output-source" muted autoplay playsinline></video>`
-                    : this.activeMotionVideo
-                    ? html`<video class=${this.activeMotionIsStream && !this.motionStreamHasSegments ? 'stream-pending' : ''} src=${this.activeMotionVideo} autoplay muted playsinline controls ?loop=${!this.activeMotionIsStream}></video>`
-                    : this.activeMotionFrame || this.outputImage
-                        ? keyed(this.outputImageNonce, html`<img src=${this.activeMotionFrame || this.outputImage} alt="latest generated frame" />`)
-                      : html`<div class="empty">Waiting for diffusion</div>`}
+                    ${this.realtimeVideoActive
+                      ? html`<canvas id="stream-output-canvas" class="stream-output-video" aria-label="realtime output"></canvas><video id="stream-output-video" class="stream-output-source" muted autoplay playsinline></video>`
+                      : this.activeMotionVideo
+                      ? html`<video class=${this.activeMotionIsStream && !this.motionStreamHasSegments ? 'stream-pending' : ''} src=${this.activeMotionVideo} autoplay muted playsinline controls ?loop=${!this.activeMotionIsStream}></video>`
+                      : this.activeMotionFrame || this.outputImage
+                          ? keyed(this.outputImageNonce, html`<img src=${this.activeMotionFrame || this.outputImage} alt="latest generated frame" />`)
+                        : html`<div class="empty">Waiting for diffusion</div>`}
+                    ${this.selectedOutputSignal !== 'output'
+                      ? html`<video id="signal-output-video" class="signal-output-video signal-output-overlay" muted autoplay playsinline></video>`
+                      : null}
                 </div>
               </div>
             </div>
@@ -627,6 +654,113 @@ export class RtdCanvasEditor extends LitElement {
       style=${`left:${handle.x}px;top:${handle.y}px;cursor:${handle.cursor}`}
       @wheel=${(event: WheelEvent) => this.zoomViewport(event, 'input')}
       @pointerdown=${(event: PointerEvent) => this.startSvgTransform(event, handle.key)}></button>`)}`
+  }
+
+  private outputTimingSummaryMs() {
+    const preferred = [
+      'server_end_to_end_ms',
+      'server_total_ms',
+      'latency_ms',
+      'inference_ms',
+      'model_inference_ms',
+    ]
+    for (const key of preferred) {
+      const value = this.outputTimings[key]
+      if (typeof value === 'number' && Number.isFinite(value) && value > 0) return value
+    }
+    return 0
+  }
+
+  private formatTimingLabel(key: string) {
+    const labels: Record<string, string> = {
+      queue_wait_ms: 'Queue wait',
+      canvas_decode_ms: 'Canvas decode',
+      primary_input_select_ms: 'Primary input select',
+      input_compose_ms: 'Input compose',
+      mask_decode_ms: 'Mask decode',
+      layer_frames_decode_ms: 'Layer frames decode',
+      layer_conditions_prepare_ms: 'Layer conditions',
+      graph_build_ms: 'Graph build',
+      graph_run_ms: 'Graph run',
+      conditioning_resolve_ms: 'Condition resolve',
+      composition_plan_ms: 'Composition plan',
+      request_build_ms: 'Request build',
+      inference_ms: 'Inference wrapper',
+      model_inference_ms: 'Backend inference',
+      output_encode_ms: 'Output encode',
+      output_persist_ms: 'Output persist',
+      persist_output_ms: 'Output persist',
+      debug_persist_ms: 'Debug persist',
+      server_total_ms: 'Server total',
+      server_end_to_end_ms: 'End to end',
+    }
+    return labels[key] ?? key.replace(/_/g, ' ').replace(/\b\w/g, (match) => match.toUpperCase())
+  }
+
+  private outputTimingEntries() {
+    const preferred = [
+      'queue_wait_ms',
+      'canvas_decode_ms',
+      'primary_input_select_ms',
+      'input_compose_ms',
+      'mask_decode_ms',
+      'layer_frames_decode_ms',
+      'layer_conditions_prepare_ms',
+      'graph_build_ms',
+      'graph_run_ms',
+      'conditioning_resolve_ms',
+      'composition_plan_ms',
+      'request_build_ms',
+      'inference_ms',
+      'model_inference_ms',
+      'output_encode_ms',
+      'output_persist_ms',
+      'debug_persist_ms',
+      'server_total_ms',
+      'server_end_to_end_ms',
+    ]
+    const keys = [...preferred, ...Object.keys(this.outputTimings).filter((key) => !preferred.includes(key))]
+    return keys
+      .map((key) => ({ key, value: this.outputTimings[key] }))
+      .filter((entry): entry is { key: string; value: number } => typeof entry.value === 'number' && Number.isFinite(entry.value) && entry.value >= 0)
+  }
+
+  private toggleOutputTimings = (event?: Event) => {
+    event?.preventDefault()
+    event?.stopPropagation()
+    const next = !this.outputTimingsExpanded
+    this.outputTimingsExpanded = next
+    $stream.setKey('outputTimingsExpanded', next)
+  }
+
+  private renderOutputTimingToggle() {
+    const summaryMs = this.outputTimingSummaryMs()
+    if (summaryMs <= 0) return null
+    return html`<button
+      class=${this.outputTimingsExpanded ? 'output-timing-chip active' : 'output-timing-chip'}
+      title="Show backend timing breakdown"
+      @click=${this.toggleOutputTimings}
+    >${summaryMs >= 100 ? Math.round(summaryMs) : summaryMs.toFixed(1)} ms</button>`
+  }
+
+  private renderOutputTimingPanel() {
+    const items = this.outputTimingEntries()
+    if (!this.outputTimingsExpanded || !items.length) return null
+    const queuedAt = typeof this.outputTimings.queued_at === 'string' ? this.outputTimings.queued_at : ''
+    const renderStartedAt = typeof this.outputTimings.render_started_at === 'string' ? this.outputTimings.render_started_at : ''
+    return html`<div class="output-timing-panel">
+      <div class="output-timing-head">
+        <strong>Backend timings</strong>
+        <button @click=${this.toggleOutputTimings}>Hide</button>
+      </div>
+      <div class="output-timing-grid">
+        ${items.map((entry) => html`<div class="output-timing-row"><span>${this.formatTimingLabel(entry.key)}</span><strong>${entry.value >= 100 ? entry.value.toFixed(0) : entry.value.toFixed(1)} ms</strong></div>`)}
+      </div>
+      ${queuedAt || renderStartedAt ? html`<div class="output-timing-meta">
+        ${queuedAt ? html`<span>Queued ${queuedAt}</span>` : null}
+        ${renderStartedAt ? html`<span>Started ${renderStartedAt}</span>` : null}
+      </div>` : null}
+    </div>`
   }
 
   private clearTransformOverlay() {
@@ -1083,10 +1217,6 @@ export class RtdCanvasEditor extends LitElement {
     return this.shadowRoot?.querySelector('#stream-output-canvas') as HTMLCanvasElement | undefined
   }
 
-  private get signalOutputCanvasElement(): HTMLCanvasElement | undefined {
-    return this.shadowRoot?.querySelector('#signal-output-canvas') as HTMLCanvasElement | undefined
-  }
-
   private get streamOutputVideoElement(): HTMLVideoElement | undefined {
     return this.shadowRoot?.querySelector('#stream-output-video') as HTMLVideoElement | undefined
   }
@@ -1097,23 +1227,63 @@ export class RtdCanvasEditor extends LitElement {
   }
 
   private outputSignalOptions() {
-    const names = ['output']
+    const names = new Set<string>(['output'])
     void this.resourceDebugVersion
-    for (const name of getSceneResourceDebugData().keys()) {
-      if (!name || names.includes(name)) continue
-      if (name.startsWith('input/resource/')) continue
-      names.push(name)
+    for (const surface of getDebugSurfaces().values()) {
+      if (!surface.id || surface.id.startsWith('input/resource/')) continue
+      names.add(surface.id)
+      names.add(surface.name)
     }
-    return names.sort((a, b) => {
+    for (const name of getSceneResourceDebugData().keys()) {
+      if (!name || names.has(name)) continue
+      if (name.startsWith('input/resource/')) continue
+      names.add(name)
+    }
+    return [...names].sort((a, b) => {
       if (a === 'output') return -1
       if (b === 'output') return 1
       return a.localeCompare(b)
     })
   }
 
-  private selectOutputSignal = (event: Event) => {
-    this.selectedOutputSignal = (event.target as HTMLSelectElement).value || 'output'
-    this.scheduleSignalInspectionDraw()
+  private toggleSignalPicker = (event: Event) => {
+    event.preventDefault()
+    event.stopPropagation()
+    this.signalPickerOpen = !this.signalPickerOpen
+  }
+
+  private renderSignalPickerGrid() {
+    const signals = this.outputSignalOptions()
+    return html`
+      <div class="signal-picker-panel">
+        <div class="signal-picker-grid">
+          ${signals.map((name) => html`
+            <button
+              class=${this.selectedOutputSignal === name ? 'signal-picker-tile active' : 'signal-picker-tile'}
+              title=${name}
+              @click=${() => this.selectOutputSignal(name)}
+            >
+              <div class="signal-picker-thumb">
+                <video class="signal-picker-video" data-signal-name=${name} muted autoplay playsinline></video>
+              </div>
+              <span class="signal-picker-name">${name}</span>
+            </button>
+          `)}
+        </div>
+      </div>
+    `
+  }
+
+  private selectOutputSignal(name: string) {
+    // Cancel any pending animation frame
+    if (this.signalInspectRaf !== undefined) {
+      window.cancelAnimationFrame(this.signalInspectRaf)
+      this.signalInspectRaf = undefined
+    }
+
+    this.selectedOutputSignal = name || 'output'
+    this.signalPickerOpen = false
+    this.syncSignalInspectionSurface()
   }
 
   private ensureSelectedOutputSignal() {
@@ -1121,22 +1291,25 @@ export class RtdCanvasEditor extends LitElement {
     if (!this.outputSignalOptions().includes(this.selectedOutputSignal)) this.selectedOutputSignal = 'output'
   }
 
-  private selectedSignalSurface(): DebugSurface | undefined {
-    if (this.selectedOutputSignal === 'output') return getDebugSurfaces().get('output')
-    const signalData = getSceneResourceDebugData()
-    const value = signalData.get(this.selectedOutputSignal) || ''
+  private selectedSignalSurface(signalName = this.selectedOutputSignal): DebugSurface | undefined {
     const surfaces = getDebugSurfaces()
+    if (signalName === 'output') return surfaces.get('output')
+    const localSurface = surfaces.get(signalName) ?? [...surfaces.values()].find((surface) => surface.name === signalName)
+    if (localSurface) return localSurface
+    const signalData = getSceneResourceDebugData()
+    const value = signalData.get(signalName) || ''
     if (value.startsWith('stream:')) {
       const id = value.slice('stream:'.length)
       return surfaces.get(id)
-        ?? [...surfaces.values()].find((surface) => surface.name === id || surface.name === this.selectedOutputSignal)
+        ?? [...surfaces.values()].find((surface) => surface.name === id || surface.name === signalName)
     }
-    return surfaces.get(this.selectedOutputSignal)
-      ?? [...surfaces.values()].find((surface) => surface.name === this.selectedOutputSignal)
+    return surfaces.get(signalName)
+      ?? [...surfaces.values()].find((surface) => surface.name === signalName)
   }
 
   private scheduleSignalInspectionDraw() {
     if (this.selectedOutputSignal === 'output') return
+    this.syncSignalInspectionSurface()
     if (this.signalInspectRaf !== undefined) return
     this.signalInspectRaf = window.requestAnimationFrame(this.drawSignalInspectionFrame)
   }
@@ -1144,96 +1317,78 @@ export class RtdCanvasEditor extends LitElement {
   private drawSignalInspectionFrame = () => {
     this.signalInspectRaf = undefined
     if (this.selectedOutputSignal === 'output') return
-    const canvas = this.signalOutputCanvasElement
-    if (!canvas) {
-      this.scheduleSignalInspectionDraw()
-      return
+    const stream = this.selectedSignalStream()
+    this.attachSignalInspectVideo(stream)
+    if (!stream) {
+      const selectedSignal = this.selectedOutputSignal
+      window.setTimeout(() => {
+        if (this.selectedOutputSignal === selectedSignal) this.scheduleSignalInspectionDraw()
+      }, 100)
     }
-    if (canvas.width !== this.stageWidth) canvas.width = this.stageWidth
-    if (canvas.height !== this.stageHeight) canvas.height = this.stageHeight
-    const context = canvas.getContext('2d', { alpha: true })
-    if (!context) return
-    this.drawAlphaInspectionBackground(context, canvas.width, canvas.height)
-    const surface = this.selectedSignalSurface()
-    if (surface?.kind === 'canvas') {
-      context.drawImage(surface.canvas, 0, 0, canvas.width, canvas.height)
-      this.applySignalInspectionVisibility(context, canvas.width, canvas.height)
-      this.scheduleSignalInspectionDraw()
-      return
-    }
-    if (surface?.kind === 'stream') {
-      const video = this.ensureSignalInspectVideo(surface.stream)
-      if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
-        context.drawImage(video, 0, 0, canvas.width, canvas.height)
-        this.applySignalInspectionVisibility(context, canvas.width, canvas.height)
-      }
-      this.scheduleSignalInspectionDraw()
-      return
-    }
-    context.fillStyle = 'rgba(230,230,236,0.72)'
-    context.font = '12px system-ui, sans-serif'
-    context.fillText('signal pending...', 12, 22)
-    this.scheduleSignalInspectionDraw()
-  }
-
-  private applySignalInspectionVisibility(context: CanvasRenderingContext2D, width: number, height: number) {
-    if (!this.selectedOutputSignalRequiresMaskPreview()) return
-    const image = context.getImageData(0, 0, width, height)
-    const data = image.data
-    let alphaPixels = 0
-    let blackAlphaPixels = 0
-    for (let i = 0; i < data.length; i += 4) {
-      const alpha = data[i + 3]
-      if (!alpha) continue
-      alphaPixels++
-      if (Math.max(data[i], data[i + 1], data[i + 2]) <= 2) blackAlphaPixels++
-    }
-    const needsLift = alphaPixels > 0 && blackAlphaPixels / alphaPixels > 0.9
-    if (!needsLift) return
-    for (let i = 0; i < data.length; i += 4) {
-      const alpha = data[i + 3]
-      if (!alpha) continue
-      const maxRgb = Math.max(data[i], data[i + 1], data[i + 2])
-      if (maxRgb > 0) continue
-      data[i] = alpha
-      data[i + 1] = alpha
-      data[i + 2] = alpha
-      data[i + 3] = 255
-    }
-    context.putImageData(image, 0, 0)
-  }
-
-  private selectedOutputSignalRequiresMaskPreview() {
-    const name = this.selectedOutputSignal
-    return name.endsWith('/CFG')
-      || name.endsWith('/Denoise')
-      || name.endsWith('/RGBAPrompt')
-      || /\/Prompt\d+$/.test(name)
   }
 
   private ensureSignalInspectVideo(stream: MediaStream) {
-    if (!this.signalInspectVideo) {
-      this.signalInspectVideo = document.createElement('video')
-      this.signalInspectVideo.muted = true
-      this.signalInspectVideo.playsInline = true
-      this.signalInspectVideo.autoplay = true
+    const video = this.signalOutputVideoElement ?? this.signalInspectVideo ?? document.createElement('video')
+    if (!this.signalOutputVideoElement) this.signalInspectVideo = video
+    video.muted = true
+    video.playsInline = true
+    video.autoplay = true
+    if (video.srcObject !== stream) {
+      video.srcObject = stream
+      void video.play().catch(() => undefined)
     }
-    if (this.signalInspectVideo.srcObject !== stream) {
-      this.signalInspectVideo.srcObject = stream
-      void this.signalInspectVideo.play().catch(() => undefined)
-    }
-    return this.signalInspectVideo
+    return video
   }
 
-  private drawAlphaInspectionBackground(context: CanvasRenderingContext2D, width: number, height: number) {
-    const tile = 16
-    context.clearRect(0, 0, width, height)
-    for (let y = 0; y < height; y += tile) {
-      for (let x = 0; x < width; x += tile) {
-        const odd = ((x / tile) + (y / tile)) % 2 >= 1
-        context.fillStyle = odd ? '#6f7280' : '#2b2d36'
-        context.fillRect(x, y, tile, tile)
-      }
+  private attachSignalInspectVideo(stream?: MediaStream) {
+    if (!stream) {
+      if (this.signalOutputVideoElement) this.signalOutputVideoElement.srcObject = null
+      if (this.signalInspectVideo) this.signalInspectVideo.srcObject = null
+      return
+    }
+    this.ensureSignalInspectVideo(stream)
+  }
+
+  private syncSignalInspectionSurface() {
+    if (this.selectedOutputSignal === 'output') {
+      this.attachSignalInspectVideo(undefined)
+      return
+    }
+    const stream = this.selectedSignalStream()
+    this.attachSignalInspectVideo(stream)
+    if (!stream) this.scheduleSignalInspectionDraw()
+  }
+
+  private selectedSignalStream(signalName = this.selectedOutputSignal) {
+    const surface = this.selectedSignalSurface(signalName)
+    if (!surface) return undefined
+    if (surface.kind === 'stream') return surface.stream
+    const sharedStream = getDebugSurfaceStream(surface.id)
+    if (sharedStream) return sharedStream
+    const existing = this.signalInspectCanvasStreams.get(surface.id)
+    if (existing && existing.canvas === surface.canvas && existing.track?.readyState !== 'ended') return existing.stream
+    existing?.track?.stop()
+    if (typeof surface.canvas.captureStream !== 'function') return undefined
+    const stream = surface.canvas.captureStream(30)
+    const track = stream.getVideoTracks()[0]
+    this.signalInspectCanvasStreams.set(surface.id, { canvas: surface.canvas, stream, track })
+    return stream
+  }
+
+  private disposeSignalInspectCanvasStreams() {
+    for (const item of this.signalInspectCanvasStreams.values()) item.track?.stop()
+    this.signalInspectCanvasStreams.clear()
+  }
+
+  private syncSignalPickerPreviewStreams() {
+    if (!this.signalPickerOpen) return
+    const videos = this.shadowRoot?.querySelectorAll<HTMLVideoElement>('video.signal-picker-video[data-signal-name]')
+    if (!videos?.length) return
+    for (const video of videos) {
+      const signalName = video.getAttribute('data-signal-name') || ''
+      const stream = this.selectedSignalStream(signalName)
+      if (video.srcObject !== stream) video.srcObject = stream ?? null
+      if (stream) void video.play().catch(() => undefined)
     }
   }
 
@@ -1280,15 +1435,15 @@ export class RtdCanvasEditor extends LitElement {
   private refreshInputCanvasCaptureSurface() {
     const lowerCanvas = this.fabricCanvas?.getElement()
     const capture = this.ensureInputCanvasCaptureCanvas()
-    const context = capture.getContext('2d', { alpha: false })
+    const context = capture.getContext('2d', { alpha: true })
     if (!lowerCanvas || !context) return
-    context.fillStyle = '#808080'
-    context.fillRect(0, 0, this.stageWidth, this.stageHeight)
+    context.clearRect(0, 0, this.stageWidth, this.stageHeight)
     context.drawImage(lowerCanvas, 0, 0, this.stageWidth, this.stageHeight)
     const upperCanvas = (this.fabricCanvas as (Canvas & { upperCanvasEl?: HTMLCanvasElement }) | undefined)?.upperCanvasEl
-    if (upperCanvas && this.pendingPaintLayerId) {
+    const isErasePreview = this.isEraseStroke(this.pendingBrushButton)
+    if (upperCanvas && this.pendingPaintLayerId && !isErasePreview) {
       context.save()
-      context.globalCompositeOperation = this.isEraseStroke(this.pendingBrushButton) ? 'destination-out' : 'source-over'
+      context.globalCompositeOperation = 'source-over'
       context.drawImage(upperCanvas, 0, 0, this.stageWidth, this.stageHeight)
       context.restore()
     }
@@ -1298,8 +1453,36 @@ export class RtdCanvasEditor extends LitElement {
     if (event?.type.includes('move') && 'buttons' in event && event.buttons === 0 && !this.rightPaintStroke) return
     if (!this.fabricCanvas?.isDrawingMode && !this.rightPaintStroke) return
     if (!this.pendingPaintLayerId && !this.selectedLayerId) return
-    this.scheduleInputCanvasCaptureRefresh()
-    this.queueLiveInputChanged()
+    this.upperCanvasLiveInputPending = true
+    if (this.upperCanvasLiveInputRaf !== undefined) return
+    this.upperCanvasLiveInputRaf = window.requestAnimationFrame(() => {
+      this.upperCanvasLiveInputRaf = undefined
+      if (!this.upperCanvasLiveInputPending) return
+      this.upperCanvasLiveInputPending = false
+      this.scheduleActiveDrawSignalRefresh()
+      this.scheduleInputCanvasCaptureRefresh()
+      this.queueLiveInputChanged()
+    })
+  }
+
+  private hasActiveDrawStroke() {
+    return !!this.rightPaintStroke || !!this.pendingPaintLayerId || (this.drawing && this.maskCanvasEditable())
+  }
+
+  private scheduleActiveDrawSignalRefresh() {
+    if (this.drawSignalRefreshRaf !== undefined) return
+    this.drawSignalRefreshRaf = window.requestAnimationFrame(() => {
+      this.drawSignalRefreshRaf = undefined
+      if (!this.hasActiveDrawStroke()) return
+      const layerId = this.pendingPaintLayerId || this.selectedLayerId
+      if (layerId) this.scheduleLayerMediaSurfaceRefresh(layerId)
+      else this.scheduleLayerMediaSurfaceRefresh()
+      this.refreshMaskPreview()
+      requestDebugSurfaceFrame('input/mask/active')
+      requestDebugSurfaceFrame('input/mask/preview')
+      this.scheduleInputCanvasCaptureRefresh(true)
+      if (this.hasActiveDrawStroke()) this.scheduleActiveDrawSignalRefresh()
+    })
   }
 
   private scheduleInputCanvasCaptureRefresh(force = false) {
@@ -1420,10 +1603,15 @@ export class RtdCanvasEditor extends LitElement {
       if (!this.inputCanvasMediaTrack || this.inputCanvasMediaTrack.readyState === 'ended' || !this.inputCanvasMediaRegistered) {
         this.ensureInputCanvasMediaTrack()
       }
+      this.refreshInputCanvasCaptureSurface()
       this.scheduleInputCanvasCaptureRefresh(force)
     }
     this.markLiveInputChanged()
     this.queueLiveStreamFrameIfInputChanged(force, refreshResources, refreshLayerConditions)
+  }
+
+  private shouldRefreshLiveResourcesOnDraw() {
+    return this.selectedOutputSignal !== 'output'
   }
 
   private layerConditionTopologySignature() {
@@ -1495,7 +1683,26 @@ export class RtdCanvasEditor extends LitElement {
     .viewport-toggles { display: flex; gap: 2px; margin-left: auto; }
     .viewport-toggles button { font-size: 10px; padding: 1px 5px; background: var(--bg-input, #14141a); border: 1px solid var(--border, #3a3a4c); border-radius: var(--radius, 2px); color: var(--fg, #d4d4d8); cursor: pointer; }
     .viewport-toggles button.active { background: var(--bg-sel, #1a3060); border-color: var(--border-focus, #4d87c4); }
-    .signal-select { min-width: 132px; max-width: 220px; height: 20px; font-size: 10px; padding: 1px 20px 1px 6px; background: var(--bg-input, #14141a); border: 1px solid var(--border, #3a3a4c); border-radius: 2px; color: var(--fg, #d4d4d8); }
+    .output-overlay-tools { margin-left: auto; display: flex; align-items: center; gap: 6px; }
+    .signal-grid-toggle { min-width: 132px; max-width: 240px; height: 20px; font-size: 10px; padding: 1px 8px; background: var(--bg-input, #14141a); border: 1px solid var(--border, #3a3a4c); border-radius: 2px; color: var(--fg, #d4d4d8); text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .signal-grid-toggle.active { border-color: var(--border-focus, #4d87c4); background: var(--bg-sel, #1a3060); }
+    .output-timing-chip { height: 20px; font-size: 10px; padding: 1px 8px; background: rgba(8, 28, 24, 0.92); border: 1px solid rgba(87, 198, 162, 0.55); border-radius: 999px; color: #bbf7df; cursor: pointer; white-space: nowrap; }
+    .output-timing-chip.active { background: rgba(18, 68, 56, 0.96); border-color: rgba(129, 236, 199, 0.85); color: #e9fff7; }
+    .output-timing-panel { position: absolute; top: 26px; right: 6px; width: min(320px, calc(100% - 12px)); z-index: 24; display: flex; flex-direction: column; gap: 8px; padding: 8px 9px; background: rgba(10, 14, 18, 0.96); border: 1px solid rgba(87, 198, 162, 0.35); border-radius: 6px; box-shadow: 0 10px 30px rgba(0,0,0,0.34); color: var(--fg, #d4d4d8); }
+    .output-timing-head { display: flex; align-items: center; gap: 8px; }
+    .output-timing-head button { margin-left: auto; font-size: 10px; padding: 1px 6px; background: var(--bg-input, #14141a); border: 1px solid var(--border, #3a3a4c); border-radius: 2px; color: var(--fg, #d4d4d8); cursor: pointer; }
+    .output-timing-grid { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 10px; font-size: 11px; }
+    .output-timing-row { display: contents; }
+    .output-timing-row span { color: var(--fg-dim, #a5a7b3); }
+    .output-timing-row strong { text-align: right; color: #effff8; font-variant-numeric: tabular-nums; }
+    .output-timing-meta { display: flex; flex-direction: column; gap: 2px; padding-top: 2px; border-top: 1px solid rgba(255,255,255,0.08); font-size: 10px; color: var(--fg-dim, #8f92a0); }
+    .signal-picker-panel { position: absolute; top: 22px; left: 6px; right: 6px; max-height: min(46%, 360px); z-index: 22; background: rgba(12,12,16,0.95); border: 1px solid var(--border, #3a3a4c); border-radius: 4px; overflow: hidden; box-shadow: 0 10px 28px rgba(0,0,0,0.38); }
+    .signal-picker-grid { overflow: auto; max-height: min(46%, 360px); padding: 6px; display: grid; grid-template-columns: repeat(auto-fill, minmax(136px, 1fr)); gap: 6px; }
+    .signal-picker-tile { display: flex; flex-direction: column; gap: 4px; margin: 0; padding: 4px; background: rgba(8,8,12,0.7); border: 1px solid rgba(255,255,255,0.12); border-radius: 4px; color: var(--fg, #d4d4d8); text-align: left; }
+    .signal-picker-tile.active { border-color: #7aadff; box-shadow: 0 0 0 1px rgba(122,173,255,0.4) inset; }
+    .signal-picker-thumb { width: 100%; aspect-ratio: 4 / 3; background: repeating-conic-gradient(#2b2d36 0% 25%, #6f7280 0% 50%) 0 0 / 16px 16px; border-radius: 3px; overflow: hidden; }
+    .signal-picker-video { width: 100%; height: 100%; object-fit: contain; display: block; }
+    .signal-picker-name { font-size: 10px; line-height: 1.25; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .resource-debug-panel { position: absolute; top: 26px; left: 6px; right: 6px; max-height: min(46%, 360px); z-index: 30; display: flex; flex-direction: column; background: rgba(12,12,16,0.94); border: 1px solid var(--border, #3a3a4c); border-radius: 4px; overflow: hidden; box-shadow: 0 10px 28px rgba(0,0,0,0.38); }
     .resource-debug-head { display: flex; align-items: center; gap: 8px; padding: 5px 7px; border-bottom: 1px solid var(--border, #3a3a4c); font-size: 11px; color: var(--fg, #d4d4d8); }
     .resource-debug-head span { color: var(--fg-dim, #7a7a8a); }
@@ -1512,6 +1719,7 @@ export class RtdCanvasEditor extends LitElement {
     .preview img, .preview video { width: 100%; height: 100%; object-fit: contain; display: block; }
     .preview.signal-inspection { background: repeating-conic-gradient(#2b2d36 0% 25%, #6f7280 0% 50%) 0 0 / 16px 16px; }
     .signal-output-canvas { width: 100%; height: 100%; object-fit: contain; display: block; }
+    .signal-output-overlay { position: absolute; inset: 0; z-index: 4; pointer-events: none; }
     .empty { color: var(--fg-dim, #7a7a8a); font-size: 12px; text-align: center; padding: 16px; }
     .selection-box { position: absolute; border: 2px dashed rgba(0, 200, 255, 0.8); pointer-events: none; box-sizing: border-box; }
     .selection-box.inverted { border-style: solid; background: rgba(0, 200, 255, 0.08); }
@@ -2406,6 +2614,7 @@ export class RtdCanvasEditor extends LitElement {
       this.pendingPaintLayerId = this.selectedLayerId
       this.pendingBrushButton = this.pointerButton(event.e)
       this.configureFabricBrush(this.pendingBrushButton)
+      this.scheduleActiveDrawSignalRefresh()
     })
     this.fabricCanvas.on('mouse:up', (event) => {
       if (this._isShapeTool() && this._shapeDrawState) {
@@ -2429,7 +2638,7 @@ export class RtdCanvasEditor extends LitElement {
       if (this.fabricCanvas?.isDrawingMode && this.pendingPaintLayerId) {
         this.scheduleLayerMediaSurfaceRefresh(this.pendingPaintLayerId)
         this.scheduleInputCanvasCaptureRefresh()
-        this.queueLiveInputChanged()
+        this.queueLiveInputChanged(false, this.shouldRefreshLiveResourcesOnDraw())
       }
     })
     this.fabricCanvas.on('path:created', (event) => {
@@ -2440,7 +2649,7 @@ export class RtdCanvasEditor extends LitElement {
       this.invalidateLayerPreview(this.pendingPaintLayerId)
       this.scheduleLayerMediaSurfaceRefresh(this.pendingPaintLayerId)
       this.scheduleInputCanvasCaptureRefresh(true)
-      this.queueLiveInputChanged(true)
+      this.queueLiveInputChanged(true, this.shouldRefreshLiveResourcesOnDraw())
     })
     const brush = new PencilBrush(this.fabricCanvas)
     brush.color = this.brushColor
@@ -2465,9 +2674,6 @@ export class RtdCanvasEditor extends LitElement {
     upperCanvas.addEventListener('pointermove', this.scheduleUpperCanvasLiveInput, true)
     upperCanvas.addEventListener('pointerup', this.scheduleUpperCanvasLiveInput, true)
     upperCanvas.addEventListener('pointercancel', this.scheduleUpperCanvasLiveInput, true)
-    upperCanvas.addEventListener('mousedown', this.scheduleUpperCanvasLiveInput)
-    upperCanvas.addEventListener('mousemove', this.scheduleUpperCanvasLiveInput)
-    upperCanvas.addEventListener('mouseup', this.scheduleUpperCanvasLiveInput)
     upperCanvas.addEventListener('contextmenu', this.preventPaintContextMenu, true)
   }
 
@@ -2481,9 +2687,6 @@ export class RtdCanvasEditor extends LitElement {
     this.upperCanvasElement.removeEventListener('pointermove', this.scheduleUpperCanvasLiveInput, true)
     this.upperCanvasElement.removeEventListener('pointerup', this.scheduleUpperCanvasLiveInput, true)
     this.upperCanvasElement.removeEventListener('pointercancel', this.scheduleUpperCanvasLiveInput, true)
-    this.upperCanvasElement.removeEventListener('mousedown', this.scheduleUpperCanvasLiveInput)
-    this.upperCanvasElement.removeEventListener('mousemove', this.scheduleUpperCanvasLiveInput)
-    this.upperCanvasElement.removeEventListener('mouseup', this.scheduleUpperCanvasLiveInput)
     this.upperCanvasElement.removeEventListener('contextmenu', this.preventPaintContextMenu, true)
     this.upperCanvasElement = undefined
   }
@@ -2890,8 +3093,10 @@ export class RtdCanvasEditor extends LitElement {
     this.rightPaintStroke = { pointerId: event.pointerId, points: [point] }
     this.upperCanvasElement.setPointerCapture(event.pointerId)
     this.renderRightPaintPreview()
+    this.scheduleLayerMediaSurfaceRefresh(this.pendingPaintLayerId)
+    this.scheduleActiveDrawSignalRefresh()
     this.scheduleInputCanvasCaptureRefresh()
-    this.queueLiveInputChanged()
+    this.queueLiveInputChanged(false, this.shouldRefreshLiveResourcesOnDraw())
   }
 
   private moveRightPaintStroke = (event: PointerEvent) => {
@@ -2903,8 +3108,10 @@ export class RtdCanvasEditor extends LitElement {
     if (!last || Math.hypot(point.x - last.x, point.y - last.y) >= 1.5) {
       this.rightPaintStroke = { ...this.rightPaintStroke, points: [...this.rightPaintStroke.points, point] }
       this.renderRightPaintPreview()
+      this.scheduleLayerMediaSurfaceRefresh(this.pendingPaintLayerId)
+      this.scheduleActiveDrawSignalRefresh()
       this.scheduleInputCanvasCaptureRefresh()
-      this.queueLiveInputChanged()
+      this.queueLiveInputChanged(false, this.shouldRefreshLiveResourcesOnDraw())
     }
   }
 
@@ -2924,6 +3131,7 @@ export class RtdCanvasEditor extends LitElement {
     this.pendingPaintLayerId = ''
     this.pendingBrushButton = 0
     this.configureFabricBrush(0)
+    this.queueLiveInputChanged(true, this.shouldRefreshLiveResourcesOnDraw())
   }
 
   private finishRightPaintStroke() {
@@ -2954,7 +3162,7 @@ export class RtdCanvasEditor extends LitElement {
     this.pendingBrushButton = 0
     this.configureFabricBrush(0)
     this.scheduleInputCanvasCaptureRefresh()
-    this.queueLiveInputChanged(true)
+    this.queueLiveInputChanged(true, this.shouldRefreshLiveResourcesOnDraw())
   }
 
   private canvasPointFromPointer(event: PointerEvent) {
@@ -3386,11 +3594,38 @@ export class RtdCanvasEditor extends LitElement {
     const parent = this.findLayer(parentLayerId)
     if (parent) this.fabricCanvas?.setActiveObject(parent)
     this.pendingPaintLayerId = ''
-    if ((parent as (FabricObject & { __isRgbaMaskLayer?: boolean }) | undefined)?.__isRgbaMaskLayer) {
-      this.rasterizeRgbaMaskLayer(parentLayerId)
+    if (erase) {
+      // Keep destination-out strokes layer-local by flattening immediately.
+      // Leaving erase paths as live Fabric children punches through lower layers.
+      if ((parent as (FabricObject & { __isRgbaMaskLayer?: boolean }) | undefined)?.__isRgbaMaskLayer) {
+        this.rasterizeRgbaMaskLayer(parentLayerId)
+      } else {
+        this.rasterizePaintLayer(parentLayerId)
+      }
       return
     }
     this.syncLayers()
+  }
+
+  private rasterizePaintLayer(layerId: string) {
+    const object = this.findLayer(layerId) as (FabricObject & { __preset?: LayerPreset; __isRgbaMaskLayer?: boolean }) | undefined
+    if (!object || !this.fabricCanvas) return
+    const canvas = this.renderLayerBlockCanvas(layerId, object)
+    const replacement = new FabricImage(canvas, {
+      left: 0,
+      top: 0,
+      originX: 'left',
+      originY: 'top',
+      name: object.get('name') || 'Layer',
+      opacity: object.opacity ?? 1,
+      visible: object.visible ?? true,
+    }) as FabricImage & { __uid?: string; __preset?: LayerPreset; __isRgbaMaskLayer?: boolean }
+    replacement.__uid = layerId
+    if (object.__preset) replacement.__preset = this.normalizeLayerPreset(object.__preset)
+    if (object.__isRgbaMaskLayer) replacement.__isRgbaMaskLayer = true
+    replacement.set({ selectable: true, evented: true })
+    this.styleTransformControls(replacement as unknown as FabricObject)
+    this.replaceLayerObject(layerId, object, replacement as unknown as FabricObject)
   }
 
   private layerEraseClipPath(layerId: string) {
@@ -3495,6 +3730,7 @@ export class RtdCanvasEditor extends LitElement {
     this.lastPointer = this.maskPoint(event)
     this.maskStrokePoints = [this.lastPointer]
     this.drawMaskPoint(this.lastPointer)
+    this.scheduleActiveDrawSignalRefresh()
     this.scheduleMaskPreviewRefresh()
     this.queueLiveMaskStreamUpdate()
   }
@@ -3515,6 +3751,7 @@ export class RtdCanvasEditor extends LitElement {
       this.lastPointer = this.maskPoint(event)
       this.maskStrokePoints = [this.lastPointer]
       this.drawMaskPoint(this.lastPointer)
+      this.scheduleActiveDrawSignalRefresh()
       this.scheduleMaskPreviewRefresh()
       this.queueLiveMaskStreamUpdate()
       return
@@ -3576,6 +3813,7 @@ export class RtdCanvasEditor extends LitElement {
     this.lastPointer = point
     const previousPoint = this.maskStrokePoints.at(-1)
     if (!previousPoint || Math.hypot(point.x - previousPoint.x, point.y - previousPoint.y) > 2) this.maskStrokePoints = [...this.maskStrokePoints, point]
+    this.scheduleActiveDrawSignalRefresh()
     this.scheduleMaskPreviewRefresh()
     this.queueLiveMaskStreamUpdate()
   }
@@ -3911,7 +4149,7 @@ export class RtdCanvasEditor extends LitElement {
   private flushLiveMaskStreamUpdate(force = true, refreshResources = false) {
     this.saveCurrentMaskScope()
     if (this.activeMaskScope) this.bumpChannelMaskRevision(this.activeMaskScope, this.activeMaskChannel)
-    this.queueLiveInputChanged(force, refreshResources)
+    this.queueLiveInputChanged(force, refreshResources, true)
   }
 
   private createRegionFromMaskStroke() {
@@ -4608,6 +4846,7 @@ export class RtdCanvasEditor extends LitElement {
   private refreshLayerMediaSurfaces() {
     if (!this.fabricCanvas || this.layerMediaDirtyIds.size === 0) return
     const objects = this.fabricCanvas.getObjects()
+    const upperCanvas = (this.fabricCanvas as (Canvas & { upperCanvasEl?: HTMLCanvasElement }) | undefined)?.upperCanvasEl
     const dirtyIds = [...this.layerMediaDirtyIds]
     this.layerMediaDirtyIds.clear()
     for (const layerId of dirtyIds) {
@@ -4616,6 +4855,12 @@ export class RtdCanvasEditor extends LitElement {
       surface.context.clearRect(0, 0, this.stageWidth, this.stageHeight)
       const object = objects.find((candidate) => (candidate as FabricObject & { __uid?: string }).__uid === layerId)
       if (object && object.visible !== false) this.drawLayerCondition(surface.context, object, layerId)
+      if (upperCanvas && this.pendingPaintLayerId === layerId) {
+        surface.context.save()
+        surface.context.globalCompositeOperation = this.isEraseStroke(this.pendingBrushButton) ? 'destination-out' : 'source-over'
+        surface.context.drawImage(upperCanvas, 0, 0, this.stageWidth, this.stageHeight)
+        surface.context.restore()
+      }
       surface.revision++
       ;(surface.track as (MediaStreamTrack & { requestFrame?: () => void }) | undefined)?.requestFrame?.()
     }
@@ -4923,6 +5168,8 @@ export class RtdCanvasEditor extends LitElement {
     ;(replacement as FabricObject & { __uid?: string; __paintChild?: boolean; __parentLayerId?: string }).__uid = layerId
     ;(replacement as FabricObject & { __paintChild?: boolean; __parentLayerId?: string }).__paintChild = false
     ;(replacement as FabricObject & { __parentLayerId?: string }).__parentLayerId = undefined
+    replacement.clipPath = undefined
+    replacement.set({ globalCompositeOperation: 'source-over' } as Partial<FabricObject>)
     block.object = replacement
     block.objects = [replacement]
     this.isRestoringHistory = true
@@ -5416,9 +5663,10 @@ export class RtdCanvasEditor extends LitElement {
     }
     context.drawImage(lowerCanvas, 0, 0, this.stageWidth, this.stageHeight)
     const upperCanvas = (this.fabricCanvas as (Canvas & { upperCanvasEl?: HTMLCanvasElement }) | undefined)?.upperCanvasEl
-    if (upperCanvas && this.pendingPaintLayerId) {
+    const isErasePreview = this.isEraseStroke(this.pendingBrushButton)
+    if (upperCanvas && this.pendingPaintLayerId && !isErasePreview) {
       context.save()
-      context.globalCompositeOperation = this.isEraseStroke(this.pendingBrushButton) ? 'destination-out' : 'source-over'
+      context.globalCompositeOperation = 'source-over'
       context.drawImage(upperCanvas, 0, 0, this.stageWidth, this.stageHeight)
       context.restore()
     }
@@ -5438,9 +5686,10 @@ export class RtdCanvasEditor extends LitElement {
     }
     context.drawImage(lowerCanvas, 0, 0, this.stageWidth, this.stageHeight)
     const upperCanvas = (this.fabricCanvas as (Canvas & { upperCanvasEl?: HTMLCanvasElement }) | undefined)?.upperCanvasEl
-    if (upperCanvas && this.pendingPaintLayerId) {
+    const isErasePreview = this.isEraseStroke(this.pendingBrushButton)
+    if (upperCanvas && this.pendingPaintLayerId && !isErasePreview) {
       context.save()
-      context.globalCompositeOperation = this.isEraseStroke(this.pendingBrushButton) ? 'destination-out' : 'source-over'
+      context.globalCompositeOperation = 'source-over'
       context.drawImage(upperCanvas, 0, 0, this.stageWidth, this.stageHeight)
       context.restore()
     }

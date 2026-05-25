@@ -22,21 +22,13 @@ import pytest
 from PIL import Image
 
 from app.composition import (
-    CFG_HI,
-    DENOISE_HI,
-    CompositionPlan,
-    CompositionWarnings,
     Layer,
-    LayeredPassPlan,
     NumericOp,
-    PassSpec,
     PromptOp,
     Region,
     RenderMode,
     RendererSupport,
     Scene,
-    SinglePassPlan,
-    TiledPassPlan,
     aggregate_mask,
     aggregate_numeric,
     aggregate_prompt,

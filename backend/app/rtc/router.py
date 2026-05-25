@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
 
-from .session import InpaintSession, _jpeg_bytes, _peer_sessions, _shared_session_manager, logger
+from .session import InpaintSession, _jpeg_bytes, _png_bytes, _peer_sessions, logger
 
 router = APIRouter(prefix="/api/rtc")
 _peer_connections: dict[str, object] = {}
@@ -195,17 +195,32 @@ async def rtc_session_socket(websocket: WebSocket) -> None:
                 payload = {key: value for key, value in debug_payload.items() if key != "__event__"}
                 await websocket.send_json({"type": event_name, **payload})
                 continue
+            frame_meta = debug_payload.get("__frame_meta__") if isinstance(debug_payload, dict) else None
+            debug_channels = {
+                key: value for key, value in debug_payload.items()
+                if key != "__frame_meta__"
+            } if isinstance(debug_payload, dict) else {}
+            if frame_meta and isinstance(frame_meta, dict):
+                await websocket.send_json({"type": "frame_meta", **frame_meta})
             if frame:
                 if not session.has_output_media_subscribers:
+                    mime = session.output_frame_mime
                     b64 = base64.b64encode(frame).decode()
-                    await websocket.send_json({"type": "frame", "mime": "image/jpeg", "data": f"data:image/jpeg;base64,{b64}"})
-            if debug_payload:
-                await websocket.send_json({"type": "debug", "channels": debug_payload})
+                    await websocket.send_json({"type": "frame", "mime": mime, "data": f"data:{mime};base64,{b64}"})
+            if debug_channels:
+                await websocket.send_json({"type": "debug", "channels": debug_channels})
 
     output_task = asyncio.create_task(send_outputs())
     try:
         await _ws_admin_log(websocket, pc_id, "session_started", transport="websocket")
-        await websocket.send_json({"type": "hello", "session_id": pc_id, "protocol": "rtd.session.v1"})
+        await websocket.send_json(
+            {
+                "type": "hello",
+                "session_id": pc_id,
+                "protocol": "rtd.session.v1",
+                "output_transport": session.output_transport,
+            }
+        )
         await websocket.send_json({"type": "input_ready", "scene_id": "", "generation": "0", "reason": "session_started"})
         while True:
             message = await websocket.receive()
@@ -353,7 +368,7 @@ async def rtc_offer(request: Request):
 
     HTTP is used once for SDP offer/answer. After that, frontend inputs
     (settings, frames, and resource blobs) are staged through data channels.
-    Output frames still use the existing SSE endpoint for now.
+    Output may be delivered as WebRTC video (default) or as per-frame images.
     """
     try:
         from aiortc import RTCPeerConnection, RTCSessionDescription
@@ -368,6 +383,8 @@ async def rtc_offer(request: Request):
         raise HTTPException(status_code=400, detail="missing WebRTC offer")
 
     requested_session = str(body.get("session_id") or body.get("pc_id") or "").strip()
+    requested_output_transport = str(body.get("output_transport") or "video").strip().lower()
+    output_transport = "image" if requested_output_transport == "image" else "video"
     session = _peer_sessions.get(requested_session) if requested_session else None
     if requested_session and session is None:
         from fastapi import HTTPException
@@ -377,17 +394,29 @@ async def rtc_offer(request: Request):
         await _close_existing_peers()
         pc_id = requested_session or uuid.uuid4().hex
         session = InpaintSession(pc_id)
+        session.set_output_transport(output_transport)
         _peer_sessions[pc_id] = session
         session.start()
     else:
         pc_id = requested_session
+        session.set_output_transport(output_transport)
 
     pc = _peer_connections.get(pc_id)
     if pc is None:
         pc = RTCPeerConnection()
         _peer_connections[pc_id] = pc
 
-    if not getattr(pc, "_rtd_output_track_attached", False):
+    if output_transport == "image" and getattr(pc, "_rtd_output_track_attached", False):
+        output_track = getattr(pc, "_rtd_output_track", None)
+        if output_track is not None:
+            try:
+                output_track.stop()
+            except Exception:
+                logger.debug("RTC[%s] failed to stop output track during image transport switch", pc_id[:8], exc_info=True)
+        setattr(pc, "_rtd_output_track", None)
+        setattr(pc, "_rtd_output_track_attached", False)
+
+    if output_transport == "video" and not getattr(pc, "_rtd_output_track_attached", False):
         output_track = _SessionOutputVideoTrack(session)
         pc.addTrack(output_track)
         setattr(pc, "_rtd_output_track", output_track)
@@ -427,8 +456,12 @@ async def rtc_offer(request: Request):
     await pc.setRemoteDescription(RTCSessionDescription(sdp=offer["sdp"], type=offer["type"]))
     answer = await pc.createAnswer()
     await pc.setLocalDescription(answer)
-    logger.info("RTC[%s] WebRTC data-channel session started", pc_id[:8])
-    return {"pc_id": pc_id, "answer": {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type}}
+    logger.info("RTC[%s] WebRTC data-channel session started: output_transport=%s", pc_id[:8], output_transport)
+    return {
+        "pc_id": pc_id,
+        "answer": {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type},
+        "output_transport": output_transport,
+    }
 
 
 @router.post("/start")
@@ -445,7 +478,7 @@ async def rtc_start(request: Request):
 
 @router.get("/{pc_id}/stream")
 async def rtc_stream(pc_id: str, request: Request):
-    """SSE stream of JPEG frames (pre-encoded in inference thread)."""
+    """SSE stream of output frames (JPEG/PNG, pre-encoded in inference thread)."""
     session = _peer_sessions.get(pc_id)
     if not session:
         from fastapi import HTTPException
@@ -456,8 +489,10 @@ async def rtc_stream(pc_id: str, request: Request):
     async def event_generator():
         try:
             if initial is not None:
-                b64 = base64.b64encode(_jpeg_bytes(initial)).decode()
-                yield f"data: data:image/jpeg;base64,{b64}\n\n"
+                initial_mime = session.output_frame_mime
+                initial_bytes = _png_bytes(initial) if initial_mime == "image/png" else _jpeg_bytes(initial)
+                b64 = base64.b64encode(initial_bytes).decode()
+                yield f"data: data:{initial_mime};base64,{b64}\n\n"
 
             while session._running:
                 if await request.is_disconnected():
@@ -471,9 +506,10 @@ async def rtc_stream(pc_id: str, request: Request):
                     payload = {key: value for key, value in debug_payload.items() if key != "__event__"}
                     yield f"event: {event_name}\ndata: {json.dumps(payload)}\n\n"
                     continue
-                # Main output frame — already JPEG bytes
+                # Main output frame — already encoded bytes
+                mime = session.output_frame_mime
                 b64 = base64.b64encode(frame).decode()
-                yield f"data: data:image/jpeg;base64,{b64}\n\n"
+                yield f"data: data:{mime};base64,{b64}\n\n"
                 # Debug payload: values are either data-URLs (images) or plain text (tagger)
                 # Images were already base64-encoded in the inference thread.
                 if debug_payload:

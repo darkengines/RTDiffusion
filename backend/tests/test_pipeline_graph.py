@@ -35,14 +35,12 @@ _hf.hf_hub_download = MagicMock(return_value="/tmp/fake")  # type: ignore[attr-d
 
 # Now safe to import project modules
 from app.pipeline_graph import (  # noqa: E402
-    ConditioningResult,
     GraphResult,
     SessionGraph,
     _TaggerState,
     merge_layer_prompts,
     resolve_conditioning_mask,
 )
-from app.schemas import ControlNetPreprocessorParams  # noqa: E402
 
 
 # ---------------------------------------------------------------------------

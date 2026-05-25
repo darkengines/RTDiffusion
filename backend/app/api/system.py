@@ -7,7 +7,6 @@ import time
 from fastapi import APIRouter, Request
 from fastapi.exception_handlers import http_exception_handler, request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException
 
 from .state import (

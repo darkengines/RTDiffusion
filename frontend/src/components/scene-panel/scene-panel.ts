@@ -14,6 +14,7 @@ import type {
   SeedRotationMode,
   StreamMotionMode,
   StreamRuntimePreset,
+  StreamVaeMode,
 } from '../../types'
 import '../../components/rtd-number/rtd-number'
 import '../../components/rtd-combo/rtd-combo'
@@ -184,9 +185,6 @@ export class RtdScenePanel extends LitElement {
   private _renderTab() {
     const { scenePanelTab } = this._stream.value
     if (scenePanelTab === 'streamdiffusion') return this._renderStreamDiffusionPanel()
-    if (scenePanelTab === 'sana') return this._renderSanaPanel()
-    if (scenePanelTab === 'causal-forcing') return html`<div class="empty layer-tab">Causal-Forcing panel pending</div>`
-    if (scenePanelTab === 'fastvideo') return html`<div class="empty layer-tab">WAN Video panel pending</div>`
     if (scenePanelTab === 'z-image') return this._renderZImagePanel()
     return this._renderSdxlPanel()
   }
@@ -286,10 +284,19 @@ export class RtdScenePanel extends LitElement {
             <option value="full">Full CFG (slowest)</option>
           </select>
         </label>
-        <rtd-number label="Frame skip threshold" .value=${st.similarityThreshold} min="0" max="1" step="0.01" decimals="2"
-          @rtd-change=${(e: CustomEvent) => $stream.setKey('similarityThreshold', clamp(e.detail.value, 0, 1, st.similarityThreshold))}></rtd-number>
-        <rtd-number label="Max consecutive skips" .value=${st.maxSkipFrames} min="0" max="60" step="1" decimals="0"
-          @rtd-change=${(e: CustomEvent) => $stream.setKey('maxSkipFrames', Math.round(clamp(e.detail.value, 0, 60, st.maxSkipFrames)))}></rtd-number>
+        ${this._renderOutputTransportControl()}
+        <label class="field inline" title="Tiny VAE is faster; full VAE is usually sharper.">
+          <span>VAE</span>
+          <select .value=${st.vaeMode}
+            @change=${(e: Event) => {
+              const v = (e.target as HTMLSelectElement).value
+              if (this._validStreamVaeMode(v)) $stream.setKey('vaeMode', v)
+            }}>
+            <option value="auto">Auto (env default)</option>
+            <option value="tiny">Tiny VAE (faster)</option>
+            <option value="full">Full VAE (higher quality)</option>
+          </select>
+        </label>
         ${this._renderSessionDirectoryControl()}
         ${this._renderTritonToggle()}
         <label class="field inline">
@@ -327,39 +334,6 @@ export class RtdScenePanel extends LitElement {
     </div>`
   }
 
-  // ── SANA tab ──────────────────────────────────────────────────────────────────
-
-  private _renderSanaPanel() {
-    const st = this._stream.value
-    const sc = this._scene.value
-    const assets = this._assets.value
-    return html`<div class="layer-tab scene-tab">
-      ${this._renderRendererStatus('sana')}
-      <slot name="region-timeline"></slot>
-      ${this._renderSamplingControls()}
-      ${this._renderSessionDirectoryControl()}
-      ${this._renderDeviceSelect('Realtime GPU', st.realtimeDevice,
-        (v) => $stream.setKey('realtimeDevice', v))}
-      <rtd-number label="SANA steps" .value=${st.sanaSteps} min="1" max="20" step="1" decimals="0"
-        @rtd-change=${(e: CustomEvent) => $stream.setKey('sanaSteps', Math.round(clamp(e.detail.value, 1, 20, st.sanaSteps)))}></rtd-number>
-      <label class="field inline">
-        <span>SANA model</span>
-        <select .value=${sc.selectedModel}
-          @change=${(e: Event) => $scene.setKey('selectedModel', (e.target as HTMLSelectElement).value)}>
-          ${assets.catalog.models.map((m) => html`<option value=${m.path}>${m.name}</option>`)}
-        </select>
-      </label>
-      <div class="button-grid">
-        <button class="stream" @click=${this._dispatchToggleStream} ?disabled=${st.status === 'connecting'}>
-          ${st.status === 'connecting' ? 'Connecting…' : st.isStreaming ? 'Stop SANA' : 'Start SANA'}
-        </button>
-        ${st.isStreaming ? html`<div class="stream-status-line">
-          ${st.displayFps === 0 && st.fps === 0 ? '⚙ Loading model…' : `● Streaming – ${(st.displayFps || st.fps).toFixed(0)} FPS`}
-        </div>` : ''}
-      </div>
-    </div>`
-  }
-
   // ── Scene generation controls ─────────────────────────────────────────────────
 
   private _renderSceneGenerationControls() {
@@ -367,6 +341,7 @@ export class RtdScenePanel extends LitElement {
     const st = this._stream.value
     return html`
       ${this._renderDeviceSelect('Realtime GPU', st.realtimeDevice, (v) => $stream.setKey('realtimeDevice', v))}
+      ${this._renderOutputTransportControl()}
       ${this._renderSessionDirectoryControl()}
       ${this._renderSamplingControls()}
       ${this._renderRealtimeSeedAndReuseControls()}
@@ -420,6 +395,21 @@ export class RtdScenePanel extends LitElement {
         ` : ''}
       </div>
     </details>`
+  }
+
+  private _renderOutputTransportControl() {
+    const st = this._stream.value
+    return html`<label class="field inline" title="Video uses WebRTC codec compression; image sends per-frame encoded output.">
+      <span>Output transport</span>
+      <select .value=${st.outputTransport}
+        @change=${(e: Event) => {
+          const v = (e.target as HTMLSelectElement).value
+          if (v === 'video' || v === 'image') $stream.setKey('outputTransport', v)
+        }}>
+        <option value="video">WebRTC video stream</option>
+        <option value="image">Per-frame PNG image</option>
+      </select>
+    </label>`
   }
 
   // ── Sampling controls ─────────────────────────────────────────────────────────
@@ -883,6 +873,10 @@ export class RtdScenePanel extends LitElement {
 
   private _validStreamMotionMode(v: string): v is StreamMotionMode {
     return ['none', 'sway', 'orbit', 'push', 'zoom'].includes(v)
+  }
+
+  private _validStreamVaeMode(v: string): v is StreamVaeMode {
+    return ['auto', 'tiny', 'full'].includes(v)
   }
 
   private _validSeedMode(v: string): v is SeedMode {

@@ -32,13 +32,11 @@ import numpy as np
 from PIL import Image
 
 from ..compose.composer import SceneComposer
-from ..compose.layer import Layer, AutoTagSpec
+from ..compose.layer import Layer
 from ..inference.caps import LayerRole
 from ..inference.session import (
     CondInput,
-    ControlNetSpec,
     FrameRequest,
-    FrameResult,
     InferenceSession,
     PromptBundle,
     RegionalPrompt,
@@ -53,7 +51,6 @@ from .resolution import (
     paste_crop,
 )
 from .types import (
-    CFGCond,
     ConditioningProvider,
     PostProcessor,
     RenderLayer,
@@ -721,10 +718,6 @@ class TiledStrategy:
     def _clip_layer_to_tile(self, rl: RenderLayer, tile: _Tile, settings: SceneSettings) -> RenderLayer:
         """Resize layer masks so they align with the tile crop (not full canvas)."""
         from dataclasses import replace
-        import math
-
-        scale_x = tile.tile_w / tile.w
-        scale_y = tile.tile_h / tile.h
 
         def _crop_mask(img: Image.Image | None) -> Image.Image | None:
             if img is None:

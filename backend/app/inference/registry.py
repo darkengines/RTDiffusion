@@ -7,14 +7,9 @@ moves here too.
 
 from __future__ import annotations
 
-import importlib.util
 import os
 
 from .caps import ALL_CHANNELS, RendererCaps
-
-
-def _module_available(name: str) -> bool:
-    return importlib.util.find_spec(name) is not None
 
 
 def _sdxl_caps() -> RendererCaps:
@@ -90,94 +85,6 @@ def _streamdiffusion_caps() -> RendererCaps:
     )
 
 
-def _sana_caps() -> RendererCaps:
-    return RendererCaps(
-        id="sana",
-        layers=True,
-        layer_roles=frozenset(("color", "mask_only")),
-        masks=frozenset(("color", "denoise")),
-        controlnets=frozenset(),  # SANA does not expose CN in current code
-        motion_transform=False,
-        video_layer=True,
-        auto_tag=False,
-        # Regional prompts are degraded to structured "Background/Midground/
-        # Foreground" sections with English spatial locators (no native
-        # per-token attention masking yet). Per-region CFG and schedule are
-        # not supported — composition emits warnings for those.
-        regional_prompts=True,
-        blend_modes=frozenset(("normal",)),
-        max_layers=4,
-        max_resolution=1024,
-        realtime=True,
-        streamable=True,
-        transport="webrtc",
-        runtime="sana",
-        native=True,
-        notes="SANA linear-attention sampler. Regional prompts via structured "
-              "LLM-style sections; per-region CFG/schedule not supported.",
-    )
-
-
-def _causal_forcing_caps() -> RendererCaps:
-    from .. import motion as _motion  # local import to avoid cycles
-
-    configured = _motion.motion_adapter_configured("causal-forcing-1step")
-    return RendererCaps(
-        id="causal-forcing",
-        layers=False,
-        layer_roles=frozenset(),
-        masks=frozenset(),
-        controlnets=frozenset(),
-        motion_transform=False,
-        video_layer=False,
-        auto_tag=False,
-        regional_prompts=False,
-        blend_modes=frozenset(("normal",)),
-        max_layers=0,
-        max_resolution=1024,
-        realtime=False,
-        streamable=configured,
-        transport="task-websocket-video" if configured else "none",
-        runtime="external-command",
-        native=False,
-        notes=(
-            "Causal-Forcing external runtime configured."
-            if configured
-            else _motion.missing_motion_adapter_message("causal-forcing-1step")
-        ),
-    )
-
-
-def _fastvideo_caps() -> RendererCaps:
-    from .. import motion as _motion
-
-    configured = _motion.motion_adapter_configured("fastvideo")
-    return RendererCaps(
-        id="fastvideo",
-        layers=False,
-        layer_roles=frozenset(),
-        masks=frozenset(),
-        controlnets=frozenset(),
-        motion_transform=False,
-        video_layer=False,
-        auto_tag=False,
-        regional_prompts=False,
-        blend_modes=frozenset(("normal",)),
-        max_layers=0,
-        max_resolution=1536,
-        realtime=False,
-        streamable=configured,
-        transport="task-websocket-video" if configured else "none",
-        runtime="external-command",
-        native=False,
-        notes=(
-            "WAN/FastVideo external runtime configured."
-            if configured
-            else _motion.missing_motion_adapter_message("fastvideo")
-        ),
-    )
-
-
 # Registry of backend id → caps factory. Each factory is called fresh every
 # time `get_backend_caps` is invoked so env-var changes take effect without
 # a process restart. Adapter classes will be registered alongside in later
@@ -186,9 +93,6 @@ BACKENDS: dict[str, "callable[[], RendererCaps]"] = {
     "sdxl": _sdxl_caps,
     "z-image": _z_image_caps,
     "streamdiffusion": _streamdiffusion_caps,
-    "sana": _sana_caps,
-    "causal-forcing": _causal_forcing_caps,
-    "fastvideo": _fastvideo_caps,
 }
 
 

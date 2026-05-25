@@ -125,9 +125,9 @@ class WarmupHint:
 class InferenceSession(Protocol):
     """A live inference backend.
 
-    Implementations: `DiffusersSession`, `StreamInferenceSession`,
-    `SanaInferenceSession`. They wrap the existing engine/stream/sana code;
-    Step 1 does not touch their hot loops.
+    Implementations: `DiffusersSession`, `StreamInferenceSession`.
+    They wrap the existing engine/stream code; Step 1 does not touch
+    their hot loops.
     """
 
     backend: str

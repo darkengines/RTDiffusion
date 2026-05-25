@@ -8,7 +8,6 @@ export {
   openInpaintSocket, openRenderSessionSocket,
   rtcStart, rtcOffer, rtcStreamUrl, rtcDeletePeer,
   postMotionTask, watchMotionTask, fetchMotionFrameBlob, fetchMotionVideoSegment,
-  postSanaVideoTask, watchSanaVideoTask, sanaVideoDownloadUrl,
   fetchImageBlob, fetchArbitraryBlob,
 } from './api'
 

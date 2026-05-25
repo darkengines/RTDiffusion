@@ -119,7 +119,8 @@ export type GeneratedLayer = { image: string; seed: number; selected: boolean; l
 
 // ── UI state types ──────────────────────────────────────────────────────────
 export type LayerPanelTab = 'mask' | 'video'
-export type ScenePanelTab = 'sdxl' | 'z-image' | 'streamdiffusion' | 'sana' | 'causal-forcing' | 'fastvideo'
+export type ScenePanelTab = 'sdxl' | 'z-image' | 'streamdiffusion'
+export type StreamOutputTransport = 'video' | 'image'
 export type ToolMode = 'select' | 'moveSelection' | 'region' | 'lassoSelect' | 'ellipseSelect' | 'magicWand' | 'brush' | 'eraser' | 'text' | 'line' | 'rect' | 'ellipse' | 'fill' | 'eyedropper'
 export type FillEdgeStrategy = 'none' | 'fringe' | 'transparent_blend'
 export type ShapeDrawMode = 'fill' | 'stroke' | 'both'
@@ -136,8 +137,9 @@ export type VideoFpsMode = 'fps' | 'sequential'
 export type SeedMode = 'fixed' | 'random' | 'increment' | 'decrement'
 export type SeedRotationMode = 'off' | 'interval' | 'frame'
 export type LatentReuseNoiseMode = 'none' | 'fixed' | 'random'
-export type StreamRuntimePreset = 'diffusers' | 'lcm-lora-sdxl' | 'sdxl-lightning-4step' | 'sdxl-turbo' | 'sana-sprint-0.6b' | 'sana-sprint-1.6b'
+export type StreamRuntimePreset = 'diffusers' | 'lcm-lora-sdxl' | 'sdxl-lightning-4step' | 'sdxl-turbo'
 export type StreamMotionMode = 'none' | 'sway' | 'orbit' | 'push' | 'zoom'
+export type StreamVaeMode = 'auto' | 'tiny' | 'full'
 export type SizePreset = { label: string; width: number; height: number }
 
 // ── ControlNet ──────────────────────────────────────────────────────────────
@@ -279,7 +281,10 @@ export type StreamMessage = {
   binary?: boolean
   error?: string | null
   debug_channels?: Record<string, string>
+  timings?: StreamTimingMap
 }
+
+export type StreamTimingMap = Record<string, number | string | undefined>
 
 // ── Editor snapshot / serialisation ────────────────────────────────────────
 export type EditorSnapshot = {
@@ -393,12 +398,13 @@ export type StoredOptions = Partial<{
   streamTimestepIndices: string
   streamFrameBufferSize: number
   streamCfgType: string
-  streamSimilarityThreshold: number
-  streamMaxSkipFrames: number
   streamRuntimePreset: StreamRuntimePreset
   streamMotionMode: StreamMotionMode
   streamMotionIntensity: number
   streamMotionSpeed: number
+  streamTritonCompile: boolean
+  streamVaeMode: StreamVaeMode
+  streamOutputTransport: StreamOutputTransport
   scenePanelTab: ScenePanelTab
   selectedEntity: EntityTarget
   sceneMaskNegated: boolean

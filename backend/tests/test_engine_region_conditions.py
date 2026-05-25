@@ -361,7 +361,6 @@ def test_soft_alpha_compositing_does_not_wipe_lower_layers() -> None:
 
 def test_realtime_frame_accepts_full_denoise_strength() -> None:
     size = (256, 256)
-    alpha = Image.new("L", size, 255)
     frame = InpaintFrame(
         prompt="cat",
         image=_png_url(Image.new("RGBA", size, (128, 128, 128, 255))),

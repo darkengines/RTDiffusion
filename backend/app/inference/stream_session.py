@@ -38,6 +38,19 @@ def _reset_latent_buffer(buffer: Any) -> Any:
     return None
 
 
+def _reset_stream_state(stream: Any) -> None:
+    state = getattr(stream, "_s", None)
+    if isinstance(state, dict):
+        state["latent_buffer"] = _reset_latent_buffer(state.get("latent_buffer"))
+    region_buffers = getattr(stream, "_region_latent_buffers", None)
+    if isinstance(region_buffers, dict):
+        region_buffers.clear()
+    region_signatures = getattr(stream, "_region_prompt_signatures", None)
+    if isinstance(region_signatures, dict):
+        region_signatures.clear()
+    setattr(stream, "_single_prompt_signature", None)
+
+
 class StreamInferenceSession:
     """Wraps a live `StreamSession` behind the `InferenceSession` protocol."""
 
@@ -63,6 +76,8 @@ class StreamInferenceSession:
         cn_end = float(hints.get("cn_end", 1.0))
         layer_regions: list = hints.get("layer_regions") or []
         composite_base = hints.get("composite_base")  # previous frame output — base for non-masked area
+        if bool(hints.get("reset_stream_state")):
+            _reset_stream_state(self.stream)
 
         # Stream takes the first CN cond's image as `control_image`; the
         # composer is expected to have merged contributions per-CN already.
@@ -201,15 +216,7 @@ class StreamInferenceSession:
         latency_ms = (time.perf_counter() - t0) * 1000.0
 
         if out is None:
-            # Concurrent skip: surface a non-error result with a placeholder
-            # so the transport can decide to drop the frame.
-            placeholder = Image.new("RGB", (request.width, request.height))
-            return FrameResult(
-                image=placeholder,
-                latency_ms=latency_ms,
-                mode="stream-skip",
-                error=None,
-            )
+            out = Image.new("RGB", (request.width, request.height))
 
         return FrameResult(
             image=out,

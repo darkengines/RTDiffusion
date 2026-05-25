@@ -442,6 +442,28 @@ describe('render session WebSocket server-driven input readiness', () => {
     expect(((socket.sent[1].scene as Record<string, unknown>).settings as Record<string, unknown>).prompt).toBe('input-c')
   })
 
+  it('stores RTC frame timing metadata independently of image transport', async () => {
+    const service = await import('./services/stream.service')
+    service.wireFullFrameExporter(async () => JSON.stringify({
+      image: 'static-image',
+      mask: 'static-mask',
+      prompt: 'timings',
+      width: 512,
+      height: 512,
+    }))
+
+    await service.startWebRtc()
+    const socket = sockets[0]
+    socket.onopen?.()
+    socket.onmessage?.({ data: JSON.stringify({ type: 'hello', session_id: 'session-a', output_transport: 'video' }) })
+    socket.onmessage?.({ data: JSON.stringify({ type: 'frame_meta', fps: 13.5, latency_ms: 74, timings: { queue_wait_ms: 4.2, inference_ms: 61.1, server_end_to_end_ms: 78.3 } }) })
+
+    expect($stream.get().fps).toBe(13.5)
+    expect($stream.get().latency).toBe(74)
+    expect($stream.get().outputTimings.server_end_to_end_ms).toBe(78.3)
+    expect($stream.get().outputTimings.inference_ms).toBe(61.1)
+  })
+
   it('sends layer prompt metadata patches without resending resources', async () => {
     const service = await import('./services/stream.service')
     service.wireFullFrameExporter(async () => ({

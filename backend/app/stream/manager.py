@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import gc
 import hashlib
-import logging
 import os
 import threading
 import time
@@ -13,18 +12,17 @@ from typing import Any
 from PIL import Image
 
 from ..session_paths import configure_torch_compile_cache
+from ..inference.pipeline_base import (
+    clamp_dims_64,
+    default_device,
+    env_model_path,
+    load_pretrained_pipe,
+    normalize_diffusers_model_id,
+)
 
 from .helpers import (
-    _TINY_VAE_SD15,
-    _TINY_VAE_SDXL,
     _TRITON_OK,
-    _build_added_cond,
-    _compute_scalings,
-    _encode_prompt,
     _is_cuda,
-    _load_vae,
-    _pil_to_tensor,
-    auto_t_indices,
     logger,
     resolve_t_indices,
 )
@@ -47,7 +45,7 @@ def _log_sig_diff(old_sig: str | None, new_sig: str, log: Any, label: str) -> No
         new_t = eval(new_sig)  # noqa: S307
         fields = ("model_path", "device", "negative_prompt",
                   "timestep_indices", "frame_buffer_size", "cfg_type", "do_full_cfg",
-                  "dims", "lora_paths", "prompt_b", "cn_model_id", "triton_compile", "session_directory")
+                  "dims", "lora_paths", "prompt_b", "cn_model_id", "triton_compile", "session_directory", "vae_mode")
         diffs = [fields[i] for i, (a, b) in enumerate(zip(old_t, new_t)) if a != b]
         log.info("%s: sig changed — fields: %s", label, diffs or "<unknown>")
     except Exception:
@@ -155,7 +153,7 @@ class SessionManager:
                     int(settings.get("height", 512)),
                 )
                 t_idx = resolve_t_indices(settings)
-                device = settings.get("device") or _default_device()
+                device = settings.get("device") or default_device()
                 self._emit_build("building", 0.50, f"Building session {w}×{h}")
                 cn_model = _load_cn_for_streaming(settings, device, pipe)
                 session = StreamSession(
@@ -169,7 +167,7 @@ class SessionManager:
                     cfg_scale=float(settings.get("cfg", 1.0)),
                     width=w,
                     height=h,
-                    use_tiny_vae=os.getenv("RTD_STREAM_TINY_VAE", "1").strip() not in ("0", "false", "no"),
+                    use_tiny_vae=_resolve_use_tiny_vae(settings),
                     prompt_b=settings.get("prompt_b", ""),
                     rcfg_delta=float(os.getenv("RTD_STREAM_RCFG_DELTA", "1.0")),
                     controlnet=cn_model,
@@ -189,7 +187,7 @@ class SessionManager:
                 triton_compile = _TRITON_OK and bool(settings.get("stream_triton_compile", True)) and env_compile
                 if triton_compile:
                     self._emit_build("compiling", 0.65,
-                        f"Compiling Triton kernels — first run takes 30-120 s (subsequent runs are instant)")
+                        "Compiling Triton kernels — first run takes 30-120 s (subsequent runs are instant)")
                 else:
                     self._emit_build("warming", 0.80, f"Warming up ({warmup_total} passes)")
                 warmup_image = self.last_output if isinstance(self.last_output, Image.Image) else None
@@ -221,8 +219,8 @@ class SessionManager:
                 return None
 
     def _ensure_pipe(self, settings: dict[str, Any]) -> Any | None:
-        model_path = settings.get("model_path") or _env_model_path()
-        device = settings.get("device") or _default_device()
+        model_path = normalize_diffusers_model_id(str(settings.get("model_path") or env_model_path()), logger)
+        device = settings.get("device") or default_device()
         loras = tuple(sorted(settings.get("lora_paths") or []))
         triton_compile = bool(settings.get("stream_triton_compile", True))
         session_directory = str(settings.get("session_directory") or "").strip()
@@ -260,8 +258,8 @@ def _session_sig(s: dict[str, Any]) -> str:
     env_compile = os.getenv("RTD_STREAM_COMPILE", "1").strip() not in ("0", "false", "no")
     triton_compile = _TRITON_OK and bool(s.get("stream_triton_compile", True)) and env_compile
     return repr((
-        s.get("model_path") or _env_model_path(),
-        s.get("device") or _default_device(),
+        normalize_diffusers_model_id(str(s.get("model_path") or _env_model_path()), logger),
+        s.get("device") or default_device(),
         s.get("negative_prompt", ""),
         tuple(resolve_t_indices(s)),
         int(s.get("stream_frame_buffer_size", 1)),
@@ -273,7 +271,24 @@ def _session_sig(s: dict[str, Any]) -> str:
         cn_model_id,
         triton_compile,
         str(s.get("session_directory") or "").strip(),
+        _stream_vae_mode(s),
     ))
+
+
+def _stream_vae_mode(settings: dict[str, Any]) -> str:
+    mode = str(settings.get("stream_vae_mode") or "auto").strip().lower()
+    if mode in {"tiny", "full"}:
+        return mode
+    return "auto"
+
+
+def _resolve_use_tiny_vae(settings: dict[str, Any]) -> bool:
+    mode = _stream_vae_mode(settings)
+    if mode == "tiny":
+        return True
+    if mode == "full":
+        return False
+    return os.getenv("RTD_STREAM_TINY_VAE", "1").strip().lower() not in ("0", "false", "no")
 
 
 def _stream_seed(settings: dict[str, Any]) -> int:
@@ -309,7 +324,6 @@ def _extract_cn_model_id(settings: dict[str, Any]) -> str:
 
 def _load_cn_for_streaming(settings: dict[str, Any], device: str, pipe: Any) -> Any | None:
     """Load the first active ControlNet model from layer_conditions, or None."""
-    import torch
     from .. import controlnet as _cn_mod
 
     for cond in (settings.get("layer_conditions") or []):
@@ -331,22 +345,16 @@ def _load_cn_for_streaming(settings: dict[str, Any], device: str, pipe: Any) -> 
 
 
 def _clamp_dims(w: int, h: int) -> tuple[int, int]:
-    """Align to 64; optionally cap longest side via RTD_STREAM_MAX_SIDE (0 = no cap)."""
-    max_side = int(os.getenv("RTD_STREAM_MAX_SIDE", "0"))
-    if max_side > 0:
-        scale = min(1.0, max_side / max(w, h, 1))
-        w = int(w * scale)
-        h = int(h * scale)
-    return max(64, w // 64 * 64), max(64, h // 64 * 64)
+    """Preserve requested dimensions unless explicit stream resize envs are set."""
+    return clamp_dims_64(w, h)
 
 
 def _default_device() -> str:
-    v = os.getenv("RTD_DEVICE", "cuda").strip().lower()
-    return "cuda:0" if v == "cuda" else v
+    return default_device()
 
 
 def _env_model_path() -> str:
-    return os.getenv("RTD_MODEL_ID") or os.getenv("RTD_MODEL_PATH") or ""
+    return env_model_path()
 
 
 def _load_pipe(model_path: str | None, device: str, lora_paths: list[str], *, triton_compile: bool = True, session_directory: str = "") -> Any | None:
@@ -363,6 +371,7 @@ def _load_pipe(model_path: str | None, device: str, lora_paths: list[str], *, tr
         logger.error("StreamSession: no model configured (set RTD_MODEL_PATH)")
         return None
 
+    model_path = normalize_diffusers_model_id(model_path, logger)
     is_cu = _is_cuda(device)
     dtype = torch.float16 if is_cu else torch.float32
     path = Path(model_path)
@@ -381,20 +390,15 @@ def _load_pipe(model_path: str | None, device: str, lora_paths: list[str], *, tr
     try:
         from diffusers import AutoPipelineForImage2Image, AutoPipelineForInpainting
 
-        kw: dict[str, Any] = {"torch_dtype": dtype}
-        if path.is_dir():
-            kw["local_files_only"] = True
-            kw["low_cpu_mem_usage"] = False
-
         if path.is_file():
             pipe = _load_single_file(path, dtype)
         else:
             # prefer inpaint pipeline (9-ch UNet handles inpainting natively)
             # but fall back to img2img which works fine with compositing
             try:
-                pipe = AutoPipelineForInpainting.from_pretrained(model_path, **kw)
+                pipe = load_pretrained_pipe(AutoPipelineForInpainting, model_path, dtype, logger=logger)
             except Exception:
-                pipe = AutoPipelineForImage2Image.from_pretrained(model_path, **kw)
+                pipe = load_pretrained_pipe(AutoPipelineForImage2Image, model_path, dtype, logger=logger)
 
         pipe = pipe.to(device)
         # from_single_file can place sub-models on unexpected devices.  Explicitly

@@ -4,7 +4,7 @@ import { reportError } from '../stores/ui.store'
 import { upsertTask } from './layer.service'
 import { openInpaintSocket, openRenderSessionSocket, rtcOffer } from './api'
 import { clearMaskBlobCache } from './mask-blob.service'
-import type { StreamMessage } from '../types'
+import type { StreamMessage, StreamTimingMap } from '../types'
 
 // ── Singleton connection state (not reactive — lifecycle objects) ─────────────
 
@@ -14,6 +14,7 @@ let _streamTimer: number | undefined
 let _sessionSocket: WebSocket | undefined
 let _webRtcMediaPeer: RTCPeerConnection | undefined
 let _webRtcMediaPeerSessionId = ''
+let _webRtcMediaPeerOutputTransport: 'video' | 'image' = 'video'
 let _webRtcMediaNegotiation: Promise<void> | undefined
 let _webRtcLiveInputMediaReady = false
 let _webRtcLiveInputMediaRegisteredOnce = false
@@ -44,16 +45,23 @@ let _webRtcWaitingForResourceBackpressure = false
 let _awaitingFrame = false
 let _awaitingFrameSentMs = 0      // timestamp when _awaitingFrame was set; 0 = not waiting
 let _sendingInpaintFrame = false  // guard against concurrent canvas exports
-let _inpaintLastSendMs = 0        // throttle to ~30 fps max
 let _inpaintSeq = 0
 let _inpaintLatestInputSeq = 0
 let _inpaintAwaitingSeq = 0
 let _inpaintSendRequested = false
 let _inpaintRetryTimer: number | undefined
-let _fpsCount = 0
-let _fpsWindowStart = 0
 let _lastWorkingModel = ''
 let _lastWorkingLoras: string[] = []
+
+function _applyOutputTimings(timings: StreamTimingMap | undefined) {
+  $stream.setKey('outputTimings', timings && typeof timings === 'object' ? { ...timings } : {})
+}
+
+function _applyFrameMeta(meta: { fps?: unknown; latency_ms?: unknown; mode?: unknown; timings?: StreamTimingMap }) {
+  if (typeof meta.fps === 'number' && Number.isFinite(meta.fps)) $stream.setKey('fps', meta.fps)
+  if (typeof meta.latency_ms === 'number' && Number.isFinite(meta.latency_ms)) $stream.setKey('latency', meta.latency_ms)
+  _applyOutputTimings(meta.timings)
+}
 
 // Callbacks wired in by the canvas-editor component
 export type FrameExporter = () => Promise<string | null>
@@ -114,6 +122,7 @@ export function requestWebRtcLiveInputUpdate() {
     requestWebRtcSettingsUpdate()
     return
   }
+  if (_webRtcSceneDirty || _sendingWebRtcScene || _webRtcWaitingForResourceBackpressure) return
   if ($scene.get().seedRotationMode !== 'off' && _webRtcSeedRotationLastAt <= 0) {
     _webRtcSeedRotationPending = true
     _webRtcSeedRotationSerial++
@@ -134,6 +143,9 @@ export function requestWebRtcLayerConditionsUpdate() {
     _webRtcSeedRotationSerial++
   }
   _webRtcSceneRequestVersion++
+  // Layer condition edits may carry new mask/image resources; force a
+  // resource refresh so the backend doesn't keep old refs.
+  _webRtcResourceRequestVersion++
   _webRtcLayerConditionsDirty = true
   _webRtcSceneDirty = true
   _scheduleWebRtcSceneSend()
@@ -158,15 +170,19 @@ export function requestRealtimeFrameUpdate(options: { refreshResources?: boolean
   requestInpaintFrameUpdate()
 }
 
+function _currentOutputTransport(): 'video' | 'image' {
+  return $stream.get().outputTransport === 'image' ? 'image' : 'video'
+}
+
 function _rtcResourceChannelOpen() {
   return _webRtcResourceChannel?.readyState === 'open'
 }
 
-async function _negotiateWebRtcMediaPeer(pc: RTCPeerConnection, sessionId: string) {
+async function _negotiateWebRtcMediaPeer(pc: RTCPeerConnection, sessionId: string, outputTransport: 'video' | 'image') {
   const run = async () => {
     const offer = await pc.createOffer()
     await pc.setLocalDescription(offer)
-    const response = await rtcOffer(offer, sessionId)
+    const response = await rtcOffer(offer, sessionId, outputTransport)
     await pc.setRemoteDescription(response.answer)
   }
   const previous = _webRtcMediaNegotiation ?? Promise.resolve()
@@ -179,9 +195,15 @@ async function _negotiateWebRtcMediaPeer(pc: RTCPeerConnection, sessionId: strin
   }
 }
 
-async function _ensureWebRtcMediaPlane(sessionId: string) {
+async function _ensureWebRtcMediaPlane(sessionId: string, outputTransport: 'video' | 'image' = _currentOutputTransport()) {
   if (!sessionId || typeof RTCPeerConnection === 'undefined') return
-  if (_webRtcMediaPeer && _webRtcMediaPeerSessionId === sessionId && _webRtcMediaPeer.connectionState !== 'failed' && _webRtcMediaPeer.connectionState !== 'closed') {
+  if (
+    _webRtcMediaPeer
+    && _webRtcMediaPeerSessionId === sessionId
+    && _webRtcMediaPeerOutputTransport === outputTransport
+    && _webRtcMediaPeer.connectionState !== 'failed'
+    && _webRtcMediaPeer.connectionState !== 'closed'
+  ) {
     if (_webRtcMediaNegotiation) await _webRtcMediaNegotiation.catch(() => undefined)
     return
   }
@@ -189,16 +211,22 @@ async function _ensureWebRtcMediaPlane(sessionId: string) {
     _webRtcMediaPeer.close()
     _webRtcMediaPeer = undefined
     _webRtcMediaPeerSessionId = ''
+    _webRtcMediaPeerOutputTransport = 'video'
     _webRtcResourceChannel = undefined
     _webRtcLiveInputMediaReady = false
+    _webRtcOutputMediaReady = false
+    _webRtcOutputMediaStream = undefined
     _webRtcMediaNegotiation = undefined
   }
   try {
     const pc = new RTCPeerConnection()
     const resources = pc.createDataChannel('resources')
-    pc.addTransceiver('video', { direction: 'recvonly' })
+    if (outputTransport === 'video') {
+      pc.addTransceiver('video', { direction: 'recvonly' })
+    }
     _webRtcMediaPeer = pc
     _webRtcMediaPeerSessionId = sessionId
+    _webRtcMediaPeerOutputTransport = outputTransport
     _webRtcResourceChannel = resources
     resources.binaryType = 'arraybuffer'
     resources.onmessage = (event) => _handleResourceChannelMessage(event as MessageEvent)
@@ -208,9 +236,14 @@ async function _ensureWebRtcMediaPlane(sessionId: string) {
     }
     pc.ontrack = (event) => {
       if (event.track.kind !== 'video') return
+      if (_webRtcMediaPeerOutputTransport !== 'video') {
+        try { event.track.stop() } catch {}
+        return
+      }
       const stream = event.streams[0] ?? new MediaStream([event.track])
       _webRtcOutputMediaReady = true
       _webRtcOutputMediaStream = stream
+      $stream.setKey('realtimeVideoActive', true)
       registerDebugStreamSurface('output/media', 'output/media', stream)
       window.dispatchEvent(new CustomEvent('rtd:rtc-output-stream', { detail: { stream } }))
     }
@@ -219,6 +252,7 @@ async function _ensureWebRtcMediaPlane(sessionId: string) {
         if (_webRtcMediaPeer === pc) {
           _webRtcMediaPeer = undefined
           _webRtcMediaPeerSessionId = ''
+          _webRtcMediaPeerOutputTransport = 'video'
           _webRtcLiveInputMediaReady = false
           _webRtcOutputMediaReady = false
           _webRtcOutputMediaStream = undefined
@@ -226,7 +260,12 @@ async function _ensureWebRtcMediaPlane(sessionId: string) {
         if (_webRtcResourceChannel === resources) _webRtcResourceChannel = undefined
       }
     }
-    await _negotiateWebRtcMediaPeer(pc, sessionId)
+    await _negotiateWebRtcMediaPeer(pc, sessionId, outputTransport)
+    if (outputTransport === 'image') {
+      _webRtcOutputMediaReady = false
+      _webRtcOutputMediaStream = undefined
+      $stream.setKey('realtimeVideoActive', false)
+    }
     window.dispatchEvent(new CustomEvent('rtd:rtc-media-plane-ready', { detail: { sessionId } }))
   } catch (error) {
     console.warn('WebRTC media/resource plane unavailable; using WebSocket resources', error)
@@ -236,6 +275,7 @@ async function _ensureWebRtcMediaPlane(sessionId: string) {
       _webRtcMediaPeer = undefined
     }
     _webRtcMediaPeerSessionId = ''
+    _webRtcMediaPeerOutputTransport = 'video'
     _webRtcMediaNegotiation = undefined
   }
 }
@@ -244,13 +284,13 @@ export async function registerWebRtcResourceMediaTrack(track: MediaStreamTrack, 
   if (!_webRtcPcId || typeof RTCPeerConnection === 'undefined') return false
   const isLiveInputMedia = meta.channel === 'canvas' || meta.channel === 'input' || meta.channel === 'frame'
   try {
-    await _ensureWebRtcMediaPlane(_webRtcPcId)
+    await _ensureWebRtcMediaPlane(_webRtcPcId, _currentOutputTransport())
     const pc = _webRtcMediaPeer
     if (!pc) return false
     const streamId = String(meta.stream_id || meta.id || `rtd_media_${Date.now().toString(36)}`)
     const stream = new MediaStream([track])
     pc.addTrack(track, stream)
-    await _negotiateWebRtcMediaPeer(pc, _webRtcPcId)
+    await _negotiateWebRtcMediaPeer(pc, _webRtcPcId, _webRtcMediaPeerOutputTransport)
     _sessionSocket?.send(JSON.stringify({ type: 'media_track', stream_id: streamId, track_id: track.id, meta }))
     registerDebugStreamSurface(streamId, String(meta.label || streamId), stream)
     _registerMediaTrackDebugChannel(streamId, String(meta.label || streamId))
@@ -319,13 +359,21 @@ function _maybeRequestWebRtcSeedRotation() {
 }
 
 function _scheduleWebRtcSceneSend() {
-  if (!_webRtcInputReady || !_webRtcSceneDirty) return
+  if (!_webRtcSceneDirty) return
+  if (!_webRtcInputReady && !_canSendSceneWhileBusy()) return
   if (_webRtcSceneScheduled) return
   _webRtcSceneScheduled = true
   queueMicrotask(() => {
     _webRtcSceneScheduled = false
     void _sendSceneRtc()
   })
+}
+
+function _canSendSceneWhileBusy() {
+  if (!_webRtcLastSceneObject) return false
+  // After the initial scene has been established, patch updates can be sent
+  // without waiting for input_ready so gesture-time signals stay in sync.
+  return true
 }
 
 function _flushWebRtcDirtyScene() {
@@ -585,19 +633,6 @@ function _handleResourceChannelMessage(event: MessageEvent) {
   }
 }
 
-// ── Realtime display FPS — updated once per second, not on every frame ────────
-
-function _updateDisplayFps() {
-  const now = performance.now()
-  if (_fpsWindowStart === 0) _fpsWindowStart = now
-  _fpsCount++
-  if (now - _fpsWindowStart >= 1000) {
-    $stream.setKey('displayFps', Math.round(_fpsCount * 1000 / (now - _fpsWindowStart)))
-    _fpsCount = 0
-    _fpsWindowStart = now
-  }
-}
-
 // ── Inpaint WebSocket ────────────────────────────────────────────────────────
 
 export function startInpaintStream() {
@@ -629,7 +664,6 @@ export function startInpaintStream() {
       _awaitingFrame = false
       _awaitingFrameSentMs = 0
       _inpaintAwaitingSeq = 0
-      _updateDisplayFps()
       return
     }
     const msg = JSON.parse(event.data) as StreamMessage
@@ -659,6 +693,7 @@ export function startInpaintStream() {
       $stream.setKey('fps', msg.fps)
       $stream.setKey('latency', msg.latency_ms)
       $stream.setKey('backendMode', msg.mode)
+      _applyOutputTimings(msg.timings)
       _lastWorkingModel = $scene.get().selectedModel
       _lastWorkingLoras = [...$scene.get().selectedLoras]
       if (msg.debug_channels) _applyDebugChannels(msg.debug_channels)
@@ -688,7 +723,6 @@ export function startInpaintStream() {
 }
 
 const _AWAIT_FRAME_TIMEOUT_MS = 8_000
-const _INPAINT_STAGING_SEND_INTERVAL_MS = 120
 const _INPAINT_MAX_BUFFERED_BYTES = 1_000_000
 const _RTC_RESOURCE_CHUNK_BYTES = 64 * 1024
 const _RTC_RESOURCE_BUFFER_HIGH_BYTES = 1_000_000
@@ -701,7 +735,6 @@ async function _sendInpaintFrame() {
   if (_sendingInpaintFrame) return  // prevent concurrent canvas exports
   const state = $stream.get()
   const streamMode = state.scenePanelTab === 'streamdiffusion'
-  const now = performance.now()
   // Watchdog: if server never replied within timeout, unblock so frames resume
   if (!streamMode && _awaitingFrame && _awaitingFrameSentMs > 0 &&
       performance.now() - _awaitingFrameSentMs > _AWAIT_FRAME_TIMEOUT_MS) {
@@ -713,15 +746,7 @@ async function _sendInpaintFrame() {
   if (streamMode && _socket.bufferedAmount > 0) return
   if (!streamMode && _socket.bufferedAmount > _INPAINT_MAX_BUFFERED_BYTES) { _scheduleInpaintFrameSend(50); return }
   if (!streamMode && !_inpaintSendRequested) return
-  if (!streamMode && _awaitingFrame) {
-    if (!_inpaintSendRequested) return
-    if (now - _inpaintLastSendMs < _INPAINT_STAGING_SEND_INTERVAL_MS) {
-      _scheduleInpaintFrameSend(_INPAINT_STAGING_SEND_INTERVAL_MS - (now - _inpaintLastSendMs))
-      return
-    }
-  }
-  // Cap at ~30 fps for stream mode — the 60 Hz RAF loop fires faster than the GPU can process
-  if (streamMode && now - _inpaintLastSendMs < 33) return
+  if (!streamMode && _awaitingFrame && !_inpaintSendRequested) return
   _sendingInpaintFrame = true
   try {
     const inputSeq = _inpaintLatestInputSeq
@@ -737,10 +762,9 @@ async function _sendInpaintFrame() {
     const { scene, resources } = await _splitFullFrameIntoScene(packet)
     packet.scene_id = scene.id
     void _replaceSceneResourceDebugData(resources, scene)
-    _inpaintLastSendMs = performance.now()
     if (!streamMode) {
       _awaitingFrame = true
-      _awaitingFrameSentMs = _inpaintLastSendMs
+      _awaitingFrameSentMs = performance.now()
       _inpaintAwaitingSeq = seq
     }
     _socket.send(JSON.stringify(packet))
@@ -765,7 +789,7 @@ export async function startWebRtc() {
     ws.onopen = () => {
       if (lifecycleSeq !== _webRtcLifecycleSeq) return
       $stream.setKey('isStreaming', true)
-      $stream.setKey('realtimeVideoActive', true)
+      $stream.setKey('realtimeVideoActive', false)
       $stream.setKey('status', 'streaming')
       _webRtcSceneRequestVersion++
       _webRtcSceneDirty = true
@@ -795,8 +819,14 @@ function _handleRenderSessionMessage(msg: Record<string, unknown>) {
   const type = String(msg.type || '')
   if (type === 'hello') {
     _webRtcPcId = String(msg.session_id || '')
+    const outputTransport = msg.output_transport === 'image' ? 'image' : _currentOutputTransport()
+    if (outputTransport === 'image') {
+      _webRtcOutputMediaReady = false
+      _webRtcOutputMediaStream = undefined
+      $stream.setKey('realtimeVideoActive', false)
+    }
     console.info('[rtd transport]', msg)
-    void _ensureWebRtcMediaPlane(_webRtcPcId)
+    void _ensureWebRtcMediaPlane(_webRtcPcId, outputTransport)
     return
   }
   if (type === 'input_ready') {
@@ -820,13 +850,19 @@ function _handleRenderSessionMessage(msg: Record<string, unknown>) {
     if (channels && typeof channels === 'object') _applyDebugChannels(channels as Record<string, string>)
     return
   }
+  if (type === 'frame_meta') {
+    _applyFrameMeta(msg as { fps?: unknown; latency_ms?: unknown; mode?: unknown; timings?: StreamTimingMap })
+    return
+  }
   if (type === 'frame') {
-    if (_webRtcOutputMediaReady) return
     const data = String(msg.data || '')
-    if (data) {
-      _updateDisplayFps()
-      window.dispatchEvent(new CustomEvent('rtd:rtc-frame', { detail: data }))
-    }
+    if (!data) return
+    if (_webRtcMediaPeerOutputTransport === 'video' && _webRtcOutputMediaReady) return
+    // Image transport mode delivers per-frame data URLs over the session socket.
+    // Write directly to the store so the non-video output path can render it.
+    $stream.setKey('outputImage', data)
+    $stream.setKey('outputImageNonce', ($stream.get().outputImageNonce || 0) + 1)
+    window.dispatchEvent(new CustomEvent('rtd:rtc-frame', { detail: data }))
     return
   }
   if (type === 'status') {
@@ -940,7 +976,8 @@ async function _sendSceneRtc() {
   if (!_webRtcPcId) return
   const channel = _sessionSocket
   if (!channel || channel.readyState !== WebSocket.OPEN) return
-  if (!_webRtcInputReady || !_webRtcSceneDirty) return
+  if (!_webRtcSceneDirty) return
+  if (!_webRtcInputReady && !_canSendSceneWhileBusy()) return
   if (_sendingWebRtcScene) { _webRtcSceneDirty = true; return }
   if (channel.bufferedAmount > _RTC_RESOURCE_BUFFER_HIGH_BYTES) {
     _webRtcSceneDirty = true
@@ -1115,6 +1152,7 @@ export function stopWebRtc() {
   if (_frameLoopRaf) { window.cancelAnimationFrame(_frameLoopRaf); _frameLoopRaf = undefined }
   if (_webRtcMediaPeer) { _webRtcMediaPeer.close(); _webRtcMediaPeer = undefined }
   _webRtcMediaPeerSessionId = ''
+  _webRtcMediaPeerOutputTransport = 'video'
   _webRtcMediaNegotiation = undefined
   if (_webRtcResourceChannel) { _webRtcResourceChannel.close(); _webRtcResourceChannel = undefined }
   const socket = _sessionSocket
@@ -1158,8 +1196,8 @@ export function stopWebRtc() {
   $stream.setKey('realtimeVideoActive', false)
   $stream.setKey('status', 'offline')
   $stream.setKey('displayFps', 0)
-  _fpsCount = 0
-  _fpsWindowStart = 0
+  $stream.setKey('outputTimings', {})
+  $stream.setKey('outputTimingsExpanded', false)
   _stoppingWebRtc = false
 }
 
@@ -1173,6 +1211,7 @@ export function stopStream() {
 const _debugChannelData = new Map<string, string>()
 const _sceneResourceDebugData = new Map<string, { resourceId: string; debugName: string; type: string; channelName: string }>()
 const _debugSurfaces = new Map<string, DebugSurface>()
+const _debugCanvasMedia = new Map<string, { canvas: HTMLCanvasElement; stream: MediaStream; track?: MediaStreamTrack }>()
 const _sceneResourceDebugMedia = new Map<string, { canvas?: HTMLCanvasElement; video?: HTMLVideoElement; url?: string }>()
 let _sceneResourceDebugSeq = 0
 
@@ -1186,6 +1225,7 @@ export function registerDebugCanvasSurface(id: string, name: string, canvas: HTM
   const existing = _debugSurfaces.get(id)
   if (existing?.kind === 'canvas' && existing.canvas === canvas && existing.name === name) return
   _debugSurfaces.set(id, { id, name, kind: 'canvas', canvas })
+  _registerDebugCanvasMedia(id, canvas)
   window.dispatchEvent(new CustomEvent('rtd:debug-surfaces-update'))
 }
 
@@ -1204,7 +1244,35 @@ function _registerMediaTrackDebugChannel(streamId: string, label: string) {
 }
 
 export function unregisterDebugSurface(id: string) {
+  const canvasMedia = _debugCanvasMedia.get(id)
+  if (canvasMedia) {
+    canvasMedia.track?.stop()
+    _debugCanvasMedia.delete(id)
+  }
   if (_debugSurfaces.delete(id)) window.dispatchEvent(new CustomEvent('rtd:debug-surfaces-update'))
+}
+
+export function getDebugSurfaceStream(id: string) {
+  const media = _debugCanvasMedia.get(id)
+  return media?.stream
+}
+
+export function requestDebugSurfaceFrame(id: string) {
+  ;(_debugCanvasMedia.get(id)?.track as (MediaStreamTrack & { requestFrame?: () => void }) | undefined)?.requestFrame?.()
+}
+
+function _registerDebugCanvasMedia(id: string, canvas: HTMLCanvasElement) {
+  const existing = _debugCanvasMedia.get(id)
+  if (existing && existing.canvas === canvas && existing.stream.getVideoTracks()[0]?.readyState !== 'ended') return
+  if (existing) {
+    const track = existing.stream.getVideoTracks()[0]
+    track.stop()
+    _debugCanvasMedia.delete(id)
+  }
+  if (typeof canvas.captureStream !== 'function') return
+  const stream = canvas.captureStream(0)
+  const track = stream.getVideoTracks()[0]
+  _debugCanvasMedia.set(id, { canvas, stream, track })
 }
 
 async function _replaceSceneResourceDebugData(resources: Map<string, SceneResource>, scene?: Record<string, unknown>) {

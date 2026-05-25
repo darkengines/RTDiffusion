@@ -125,8 +125,6 @@ class InpaintFrame(BaseModel):
     stream_timestep_indices: list[int] = Field(default_factory=lambda: [0, 16, 32, 45], max_length=16)
     stream_frame_buffer_size: int = Field(default=1, ge=1, le=4)
     stream_cfg_type: str = Field(default="self", max_length=16)
-    stream_similarity_threshold: float = Field(default=0.98, ge=0.0, le=1.0)
-    stream_max_skip_frames: int = Field(default=10, ge=0, le=60)
     stream_triton_compile: bool = False
     # When set (0..1), overrides stream_timestep_indices via an auto-picker:
     # higher quality → more denoising steps. None = use raw indices above.
@@ -217,7 +215,7 @@ class MotionClipRequest(BaseModel):
     model_path: str | None = Field(default=None, max_length=1000)
     device: str | None = Field(default=None, max_length=32)
     lora_paths: list[str] = Field(default_factory=list, max_length=16)
-    model: str = Field(default="causal-forcing-1step", max_length=80)
+    model: str = Field(default="krea-realtime-video", max_length=80)
     motion: str = Field(default="idle", max_length=80)
     region: str = Field(default="full", max_length=80)
     fps: int = Field(default=16, ge=4, le=60)

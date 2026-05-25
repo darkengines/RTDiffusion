@@ -17,12 +17,7 @@ Full CFG:
 
 from __future__ import annotations
 
-import gc
 import logging
-import os
-import threading
-import time
-from pathlib import Path
 from typing import Any
 
 from PIL import Image

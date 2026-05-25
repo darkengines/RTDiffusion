@@ -18,7 +18,7 @@ from typing import Protocol, runtime_checkable
 
 from PIL.Image import Image
 
-from ..inference.session import ControlNetSpec, CondInput, FrameResult
+from ..inference.session import ControlNetSpec, CondInput
 
 
 # ── Scalar / spatial CFG ──────────────────────────────────────────────────────
@@ -149,8 +149,6 @@ class RenderLayer:
         Returns (x, y, w, h) in canvas pixels, or None if the layer is empty.
         Falls back to the full canvas when neither mask has a bbox.
         """
-        from PIL import ImageChops
-        import numpy as np
 
         src = self.mask_denoise or (
             self.color.getchannel("A")

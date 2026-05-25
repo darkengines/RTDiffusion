@@ -17,9 +17,7 @@ expose the same keys real SD/SDXL checkpoints use to signal their topology.
 
 from __future__ import annotations
 
-import importlib
 import sys
-import types
 from pathlib import Path
 from unittest.mock import MagicMock
 

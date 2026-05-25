@@ -13,6 +13,11 @@ from PIL import Image, ImageChops, ImageEnhance, ImageFilter, ImageOps, ImageSta
 from ..config import load_local_env
 from ..assets import LORA_DIRS, default_model_path
 from ..image_io import alpha_to_empty_mask, data_url_bytes, decode_data_url, decode_data_url_rgba, encode_data_url, mask_to_luma, rgba_to_neutral_rgb
+from ..inference.pipeline_base import (
+    load_pretrained_pipe,
+    load_single_file_pipe,
+    normalize_diffusers_model_id,
+)
 from ..layerdiffuse import LayerDiffuseDecoder
 from ..pipeline_graph import resolve_conditioning_mask
 from ..schemas import InpaintFrame, InpaintResult, LayerCondition, LayerGenerateFrame, LayerGenerateResult, LayerVariation
@@ -20,7 +25,7 @@ from ..session_paths import configure_torch_compile_cache, ensure_session_layout
 from .. import controlnet as _cn_module
 
 from .config import EngineConfig, ProgressCallback, ChunkCallback
-from .accels import _UNetONNXWrapper, _TRTUNetRunner, _collect_engine_debug
+from .accels import _TRTUNetRunner, _collect_engine_debug
 from .regional_attention import RegionalAttentionRegion, RegionalAttentionSpec, regional_attention_context
 
 load_local_env()
@@ -168,7 +173,7 @@ class DiffusionEngine:
             if is_cuda_device(self.config.device):
                 torch.backends.cuda.matmul.allow_tf32 = True
                 torch.backends.cudnn.allow_tf32 = True
-            model_id = self._normalize_diffusers_model_id(self.config.model_id or default_model_path())
+            model_id = normalize_diffusers_model_id(self.config.model_id or default_model_path(), logger)
             is_z_image = self._looks_like_z_image_model(model_id)
             if is_z_image and is_cuda_device(self.config.device):
                 dtype = torch.bfloat16
@@ -314,54 +319,15 @@ class DiffusionEngine:
 
     @staticmethod
     def _normalize_diffusers_model_id(model_id: str) -> str:
-        path = Path(model_id)
-        if not path.is_file():
-            return model_id
-        for parent in path.parents:
-            if (parent / "model_index.json").is_file():
-                logger.warning("Selected %s is a Diffusers component file; loading pipeline folder %s instead", path, parent)
-                return str(parent)
-        return model_id
+        return normalize_diffusers_model_id(model_id, logger)
 
     @staticmethod
     def _load_pipe(pipeline_class, model_id: str, dtype, variant: str | None):
-        model_path = Path(model_id)
-        if model_path.is_dir():
-            return pipeline_class.from_pretrained(
-                str(model_path),
-                torch_dtype=dtype,
-                variant=variant,
-                local_files_only=True,
-                low_cpu_mem_usage=False,  # prevents meta-tensor init that breaks .to(device)
-            )
-        try:
-            return pipeline_class.from_pretrained(model_id, torch_dtype=dtype, variant=variant)
-        except OSError as exc:
-            message = str(exc)
-            if "scheduler_config.json" not in message:
-                raise
-            logger.warning("Model cache is missing scheduler_config.json for %s; retrying with force_download", model_id)
-            return pipeline_class.from_pretrained(model_id, torch_dtype=dtype, variant=variant, force_download=True)
+        return load_pretrained_pipe(pipeline_class, model_id, dtype, variant=variant, logger=logger)
 
     @staticmethod
     def _load_single_file_pipe(pipeline_class, model_id: str, dtype):
-        model_path = Path(model_id)
-        try:
-            return pipeline_class.from_single_file(
-                str(model_path),
-                torch_dtype=dtype,
-                local_files_only=True,
-                use_safetensors=model_path.suffix.lower() == ".safetensors",
-            )
-        except Exception as exc:
-            message = str(exc)
-            if "CLIPTextModel" in message and "missing" in message:
-                raise RuntimeError(
-                    f"{model_path.name} is not a complete Stable Diffusion image checkpoint. "
-                    "It is missing text encoder weights, so Diffusers cannot load it as an inpaint/img2img pipeline. "
-                    "Choose a full SD/SDXL checkpoint or set RTD_MODEL_PATH to a known inpaint checkpoint."
-                ) from exc
-            raise
+        return load_single_file_pipe(pipeline_class, model_id, dtype)
 
     def _load_z_image_single_file_pipe(self, pipeline_class, model_id: str, dtype):
         from diffusers import AutoencoderKL, FlowMatchEulerDiscreteScheduler
@@ -463,7 +429,7 @@ class DiffusionEngine:
         image: Image.Image,
         mask: Image.Image,
     ) -> Image.Image | None:
-        if not (frame.stochastic_similarity_filter or frame.stream_diffusion) or self._ssf_cache is None:
+        if frame.stream_diffusion or not frame.stochastic_similarity_filter or self._ssf_cache is None:
             return None
         if self._ssf_cache.get("signature") != self._sampling_signature(base_frame):
             return None
@@ -476,18 +442,15 @@ class DiffusionEngine:
         mask_delta = self._mean_abs_delta(previous_mask, self._probe_bytes(mask, "L"))
         image_threshold = self.config.ssf_image_threshold
         mask_threshold = self.config.ssf_mask_threshold
-        if frame.stream_diffusion:
-            image_threshold = max(0.0, (1.0 - frame.stream_similarity_threshold) * 255.0)
-            mask_threshold = image_threshold
         if image_delta > image_threshold or mask_delta > mask_threshold:
             return None
         skips_value = self._ssf_cache.get("skips", 0)
         skips = skips_value if isinstance(skips_value, int) else 0
-        max_skips = frame.stream_max_skip_frames if frame.stream_diffusion else self.config.ssf_max_skips
+        max_skips = self.config.ssf_max_skips
         if skips >= max_skips:
             self._ssf_cache["skips"] = 0
             return None
-        if not frame.stream_diffusion and random.random() > self.config.ssf_skip_probability:
+        if random.random() > self.config.ssf_skip_probability:
             self._ssf_cache["skips"] = 0
             return None
         self._ssf_cache["skips"] = skips + 1
@@ -501,7 +464,7 @@ class DiffusionEngine:
         mask: Image.Image,
         output: Image.Image,
     ) -> None:
-        if not (frame.stochastic_similarity_filter or frame.stream_diffusion):
+        if frame.stream_diffusion or not frame.stochastic_similarity_filter:
             self._ssf_cache = None
             return
         self._ssf_cache = {
@@ -680,8 +643,6 @@ class DiffusionEngine:
             frame.stream_quality,
             frame.stream_frame_buffer_size,
             frame.stream_cfg_type,
-            round(frame.stream_similarity_threshold, 4),
-            frame.stream_max_skip_frames,
             frame.seed if not frame.stream_diffusion else None,
             frame.seed_mode if not frame.stream_diffusion else "fixed",
             frame.seed_variation if not frame.stream_diffusion else 0,
@@ -888,7 +849,6 @@ class DiffusionEngine:
         if not frame.layer_conditions:
             return output
         current = output.convert("RGB")
-        base_prompt = (frame.prompt or "").strip()
         conditions = sorted(frame.layer_conditions, key=lambda item: item.z_index if item.z_index is not None else 0)
         for condition in conditions:
             mode = condition.mode if condition.mode in {"mask", "add", "multiply", "override"} else "prompt_mix"
@@ -1181,7 +1141,7 @@ class DiffusionEngine:
                 self.config.stream_trt_cache_dir = str(layout["trt_cache"])
         else:
             self.config.stream_trt_cache_dir = os.getenv("RTD_STREAM_TRT_CACHE", "outputs/trt-engines")
-        next_model = self._normalize_diffusers_model_id(frame.model_path or self.model_id)
+        next_model = normalize_diffusers_model_id(frame.model_path or self.model_id, logger)
         needs_reload_for_compile_off = compile_changed and not desired_compile and self._compile_unet_active
         if next_model and (next_model != self.model_id or self.pipe is None or needs_reload_for_compile_off or session_directory_changed):
             old_model_id = self.model_id
@@ -1870,7 +1830,9 @@ class DiffusionEngine:
 
     def _streamdiffusion_compile_trt(self, frame: InpaintFrame, session: dict[str, Any], torch) -> None:
         """Export the UNet to ONNX then build (or load) a TensorRT FP16 engine and install it as session["unet"]."""
-        import hashlib, os, tempfile
+        import hashlib
+        import os
+        import tempfile
 
         batch = session["batch_size"] * (2 if session["do_full_cfg"] else 1)
         latent_h = frame.height // 8

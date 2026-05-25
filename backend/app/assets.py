@@ -149,30 +149,14 @@ def _model_assets() -> list[dict[str, str | int | bool]]:
 
 def _video_model_assets() -> list[dict[str, str | int | bool]]:
     items: list[dict[str, str | int | bool]] = []
-    for env_name in (
-        "RTD_NATIVE_WAN_MODEL",
-        "RTD_NATIVE_WAN_HIGH_MODEL",
-        "RTD_NATIVE_WAN_LOW_MODEL",
-        "RTD_NATIVE_FASTVIDEO_MODEL",
-        "RTD_NATIVE_FASTVIDEO_HIGH_MODEL",
-        "RTD_NATIVE_FASTVIDEO_LOW_MODEL",
-        "RTD_FASTVIDEO_MODEL",
-        "RTD_FASTVIDEO_HIGH_MODEL",
-        "RTD_FASTVIDEO_LOW_MODEL",
-    ):
-        configured = os.getenv(env_name, "").strip()
-        if configured:
-            items.append(_describe_configured_path(configured, preferred=True))
     for path in _scan(VIDEO_MODEL_DIRS, VIDEO_MODEL_SUFFIXES):
         name = path.name.lower()
-        if any(token in name for token in ("wan", "fastvideo", "ltx", "hunyuan", "cogvideo")) and not _unsupported_native_video_asset(path):
+        if any(token in name for token in ("ltx", "hunyuan", "cogvideo")) and not _unsupported_native_video_asset(path):
             items.append(_describe(path, preferred=False))
     return _dedupe_assets(items)
 
 
 def _unsupported_native_video_asset(path: Path) -> bool:
-    if _wan_gguf_runtime_configured():
-        return False
     if "dasiwa" in path.name.lower():
         return True
     if path.suffix.lower() == ".gguf":
@@ -187,10 +171,6 @@ def _unsupported_native_video_asset(path: Path) -> bool:
         return metadata.get("quantization.bits", "").upper() == "NVFP4"
     except Exception:
         return False
-
-
-def _wan_gguf_runtime_configured() -> bool:
-    return bool(os.getenv("RTD_WAN_GGUF_COMMAND", "").strip() or os.getenv("RTD_FASTVIDEO_GGUF_COMMAND", "").strip())
 
 
 def _scan(roots: list[Path], suffixes: set[str]) -> list[Path]:

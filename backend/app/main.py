@@ -14,7 +14,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.exceptions import HTTPException
 
-from .api import assets, inpaint, layer, motion, sana, sources, system
+from .api import assets, inpaint, layer, sources, system
 from .api.state import on_stream_session_build
 from .config import load_local_env
 from .rtc import router as rtc_router, _shared_session_manager as _stream_session_manager
@@ -71,7 +71,5 @@ app.include_router(rtc_router)
 app.include_router(system.router)
 app.include_router(assets.router)
 app.include_router(sources.router)
-app.include_router(sana.router)
 app.include_router(layer.router)
-app.include_router(motion.router)
 app.include_router(inpaint.router)

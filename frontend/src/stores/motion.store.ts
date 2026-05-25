@@ -9,7 +9,6 @@ export interface MotionState {
   fps: number
   duration: number
   intensity: number
-  fastVideoModelPath: string
   device: string
   activeFrame: string
   activeVideo: string
@@ -18,12 +17,6 @@ export interface MotionState {
   isGenerating: boolean
   chunkIndex: number
   task: MotionTaskProgress | undefined
-  sanaVideoModel: string
-  sanaVideoNumFrames: number
-  sanaVideoGuidance: number
-  sanaVideoSteps: number
-  sanaVideoTask: Record<string, unknown> | null
-  sanaVideoTaskId: string
   videoUrl: string
   videoLoopMode: VideoLoopMode
   videoStart: number
@@ -37,11 +30,10 @@ export const $motion = map<MotionState>({
   prompt: 'adult woman holding a lollipop, calm gaze at the viewer, subtle natural motion, same identity, same lighting',
   arrivalPrompt: '',
   negativePrompt: 'identity change, outfit change, camera cut, large motion, deformation, flicker',
-  model: 'causal-forcing-1step',
+  model: 'krea-realtime-video',
   fps: 16,
   duration: 2,
   intensity: 1,
-  fastVideoModelPath: '',
   device: '',
   activeFrame: '',
   activeVideo: '',
@@ -50,12 +42,6 @@ export const $motion = map<MotionState>({
   isGenerating: false,
   chunkIndex: 0,
   task: undefined,
-  sanaVideoModel: '480p',
-  sanaVideoNumFrames: 81,
-  sanaVideoGuidance: 6.0,
-  sanaVideoSteps: 20,
-  sanaVideoTask: null,
-  sanaVideoTaskId: '',
   videoUrl: '',
   videoLoopMode: 'loop',
   videoStart: 0,

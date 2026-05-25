@@ -11,15 +11,12 @@ session is injected via monkeypatching.
 from __future__ import annotations
 
 import csv
-import io
 import sys
 import tempfile
 import types
-from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import numpy as np
-import pytest
 from PIL import Image
 
 
@@ -149,10 +146,6 @@ class TestSigmoidDetection:
         tag_names = ["a_tag", "b_tag", "c_tag"]
         tag_categories = [0, 0, 0]  # all general — no filtering
 
-        fake_csv = _make_tag_csv([
-            {"tag_id": i, "name": n, "category": c, "count": 100}
-            for i, (n, c) in enumerate(zip(tag_names, tag_categories))
-        ])
         fake_session = _make_fake_session(scores.reshape(1, -1))
 
         # Patch the cache directly so no HF download happens

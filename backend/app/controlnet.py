@@ -20,7 +20,6 @@ kept only for explicitly SD1.5 pipelines.
 
 from __future__ import annotations
 
-import io
 import logging
 import threading
 from typing import Any
@@ -469,8 +468,6 @@ _pose_landmarker_cache: dict[str, Any] = {}  # key = "model" → detector or Fal
 def _native_openpose(image: Image.Image) -> Image.Image:
     """Pose skeleton using mediapipe PoseLandmarker (0.10+ API), with softedge fallback."""
     import numpy as np
-    import os
-    from pathlib import Path as _Path
 
     result = _try_mediapipe_landmarker(image)
     if result is not None:
