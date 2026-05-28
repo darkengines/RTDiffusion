@@ -31,6 +31,14 @@ import { requestRealtimeFrameUpdate, startWebRtc, stopStream, wireFullFrameExpor
 import { OPTIONS_KEY, OPTIONS_VERSION } from '../../constants'
 import type { LayerPreset, MaskChannel, RegionItem, RegionTarget, ScenePanelTab, StoredOptions } from '../../types'
 
+// v2 layer aggregation: augment the outgoing wire payload with the new
+// rgba_b64 / cfg_map_b64 / denoise_map_b64 / prompts[] fields decoded by
+// backend ``app.render_plan.plan_from_wire``. The legacy ``layer_conditions``
+// stay alongside for ControlNet / tagger plumbing.
+import { aggregate } from '../../model/aggregator'
+import { aggregatedToWire, createCanvasPngEncoder } from '../../model/encoder'
+import { buildSceneFromLayerConditions, createDomImageDecoder, type LegacyLayerCondition } from '../../model/from-layer-conditions'
+
 import '../toolbar/toolbar'
 import '../layer-list/layer-list'
 import '../task-monitor/task-monitor'
@@ -278,6 +286,47 @@ export class RtdAppShell extends LitElement {
       outputTransport: stream.outputTransport,
       tritonCompile: stream.tritonCompile,
       debugStreamsEnabled: stream.debugStreamsEnabled,
+    })
+  }
+
+  // Lazy reusable canvas for the v2 encoder + decoder so we don't allocate
+  // one per frame. Allocated on first use; survives for the lifetime of the
+  // shell.
+  private _v2Canvas: HTMLCanvasElement | null = null
+  private _v2CanvasFactory = () => {
+    if (!this._v2Canvas) this._v2Canvas = document.createElement('canvas')
+    return this._v2Canvas
+  }
+  private _v2Encoder = createCanvasPngEncoder(this._v2CanvasFactory)
+  private _v2Decoder = createDomImageDecoder(this._v2CanvasFactory)
+
+  private async _augmentWithV2(
+    settings: Record<string, unknown>,
+    layerConditions: LegacyLayerCondition[],
+    sceneSettings: ReturnType<RtdAppShell['_rtcSceneSettingsPayload']>,
+  ): Promise<void> {
+    const w = Number(sceneSettings.width) || 0
+    const h = Number(sceneSettings.height) || 0
+    if (!w || !h) return
+    const scene = await buildSceneFromLayerConditions(layerConditions, {
+      width: w,
+      height: h,
+      basePrompt: String(sceneSettings.prompt ?? ''),
+      baseNegativePrompt: String(sceneSettings.negative_prompt ?? ''),
+      baseCfg: Number(sceneSettings.cfg ?? 1.5),
+      baseDenoise: Number(sceneSettings.strength ?? 1.0),
+    }, this._v2Decoder)
+    if (scene.layers.length === 0) return
+    const wire = aggregatedToWire(aggregate(scene), this._v2Encoder)
+    Object.assign(settings, {
+      rgba_b64: wire.rgba_b64,
+      cfg_map_b64: wire.cfg_map_b64,
+      denoise_map_b64: wire.denoise_map_b64,
+      prompts: wire.prompts,
+      base_prompt: wire.base_prompt,
+      base_negative_prompt: wire.base_negative_prompt,
+      base_cfg: wire.base_cfg,
+      base_denoise: wire.base_denoise,
     })
   }
 
@@ -529,12 +578,25 @@ export class RtdAppShell extends LitElement {
         const image = await editor.exportFrame()
         if (!image) return null
         const mask = editor.exportMaskForStream()
-        const settings = {
+        const layerConditions = pcId
+          ? await editor.exportLayerConditionsForRtcResources()
+          : editor.exportLayerConditions()
+        const sceneSettings = this._rtcSceneSettingsPayload()
+        const settings: Record<string, unknown> = {
           image,
           mask,
-          ...this._rtcSceneSettingsPayload(),
-          layer_conditions: pcId ? await editor.exportLayerConditionsForRtcResources() : editor.exportLayerConditions(),
+          ...sceneSettings,
+          layer_conditions: layerConditions,
           pipeline_nodes: editor.exportPipelineNodes(),
+        }
+        // v2 aggregation: derive rgba_b64/cfg_map_b64/denoise_map_b64/prompts[]
+        // from the same layer_conditions list and attach to the settings.
+        // Backend rtc/session.py activates plan_from_wire when rgba_b64 is
+        // present; legacy fields remain available alongside for CN plumbing.
+        try {
+          await this._augmentWithV2(settings, layerConditions as LegacyLayerCondition[], sceneSettings)
+        } catch (err) {
+          console.warn('[rtd] v2 augmentation failed; falling back to legacy fields only', err)
         }
         if (pcId) return settings
         return JSON.stringify({
