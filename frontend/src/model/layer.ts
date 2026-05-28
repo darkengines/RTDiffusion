@@ -81,6 +81,13 @@ export class Layer {
     this.version += 1
   }
 
+  /** Public bump for direct buffer mutations (paint engine writes pixels in
+   *  place without going through a setter). Pass the channel for hooks; the
+   *  channel argument is informational only -- internal version is one int. */
+  bumpVersion(_channel?: unknown): void {
+    this.version += 1
+  }
+
   setVisible(v: boolean): void {
     if (this.visible !== v) { this.visible = v; this._bump() }
   }
