@@ -71,6 +71,32 @@ class LayerCondition(BaseModel):
     controlnet_use_layer_frame: bool = False
 
 
+class WirePrompt(BaseModel):
+    """Per-prompt entry for the v2 layer wire format.
+
+    Multiple prompts per layer are flattened into a single list before sending;
+    the order is bottom-up. ``mask_ref`` / ``mask_b64`` is the per-prompt
+    attention mask (L-mode PNG); omit both for a whole-canvas prompt.
+    """
+
+    text: str = Field(default="", max_length=2000)
+    negative: str = Field(default="", max_length=2000)
+    mask_ref: str | None = Field(default=None, max_length=64)
+    mask_b64: str | None = None
+
+
+class WireControlNet(BaseModel):
+    """Per-layer ControlNet config for the v2 layer wire format."""
+
+    layer_id: str = Field(default="", max_length=200)
+    model: str = Field(default="", max_length=64)
+    model_path: str | None = Field(default=None, max_length=1000)
+    scale: float = Field(default=1.0, ge=0.0, le=2.0)
+    start: float = Field(default=0.0, ge=0.0, le=1.0)
+    end: float = Field(default=1.0, ge=0.0, le=1.0)
+    preprocessor_params: ControlNetPreprocessorParams = Field(default_factory=ControlNetPreprocessorParams)
+
+
 class PipelineNode(BaseModel):
     """A single node in the per-session processing graph."""
     id: str = Field(max_length=200)
@@ -143,6 +169,23 @@ class InpaintFrame(BaseModel):
     tile_divisions: int = Field(default=2, ge=1, le=8)
     tile_overlap: int = Field(default=128, ge=0, le=512)
     layer_bbox_padding: int = Field(default=64, ge=0, le=256)
+
+    # ── v2 layer wire format (additive; Phase 3 will gut the legacy fields
+    # above once engines consume RenderPlan). The frontend aggregates the
+    # layer stack and sends three flat buffers + a flat prompt list; the
+    # backend decodes via ``app.render_plan.plan_from_wire``.
+    rgba_ref: str | None = Field(default=None, max_length=64)
+    rgba_b64: str | None = None
+    cfg_map_ref: str | None = Field(default=None, max_length=64)
+    cfg_map_b64: str | None = None
+    denoise_map_ref: str | None = Field(default=None, max_length=64)
+    denoise_map_b64: str | None = None
+    prompts: list[WirePrompt] = Field(default_factory=list, max_length=64)
+    controlnet: list[WireControlNet] = Field(default_factory=list, max_length=16)
+    base_prompt: str = Field(default="", max_length=2000)
+    base_negative_prompt: str = Field(default="", max_length=2000)
+    base_denoise: float = Field(default=1.0, ge=0.0, le=1.0)
+    base_cfg: float = Field(default=1.5, ge=0.0, le=30.0)
 
     def allows_scene_result_reuse(self) -> bool:
         """Whether transports may replay a cached scene result for this frame.
