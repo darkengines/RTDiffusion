@@ -420,14 +420,12 @@ class DiffusionEngine:
         self._apply_sampler(frame.sampler, frame.scheduler)
         output = self._mock_inpaint(image, mask, base_frame.prompt)
         if self.pipe is not None:
-            strategy = base_frame.render_strategy
-            if strategy == "per_layer" and base_frame.layer_conditions:
-                output = self._per_layer_inpaint(image, mask, base_frame)
-            elif strategy == "tiled":
-                output = self._tiled_inpaint(image, mask, base_frame)
-            else:
-                output = self._diffusers_inpaint(image, mask, base_frame)
-                output = self._apply_layer_region_conditions(output, base_frame)
+            # v2 layer model: always single-pass. The frontend aggregates the
+            # layer stack into rgba/cfg_map/denoise_map (decoded in rtc/session
+            # via plan_from_wire). Per_layer and tiled strategies were removed
+            # along with composition.scene_from_legacy / render.strategies.
+            output = self._diffusers_inpaint(image, mask, base_frame)
+            output = self._apply_layer_region_conditions(output, base_frame)
         output = self._apply_residual_cfg(output, mask, base_frame)
         output = self._apply_zero_denoise_layer_constraints(output, frame)
         output = self._apply_layer_soft_alpha_compositing(output, image, frame)
@@ -2185,149 +2183,6 @@ class DiffusionEngine:
     def _tensor_to_pil(image_tensor) -> Image.Image:
         array = (image_tensor.permute(1, 2, 0).float().numpy() * 255).clip(0, 255).astype("uint8")
         return Image.fromarray(array)
-
-    def _per_layer_condition_mask(self, condition: LayerCondition, width: int, height: int) -> Image.Image | None:
-        if condition.prompt_mask:
-            try:
-                return mask_to_luma(decode_data_url(condition.prompt_mask)).resize((width, height), Image.Resampling.LANCZOS)
-            except Exception:
-                logger.exception("per_layer: failed to decode prompt mask for %s", condition.name or condition.layer_id)
-        try:
-            layer_rgba = decode_data_url_rgba(condition.image).resize((width, height), Image.Resampling.LANCZOS)
-        except Exception:
-            return None
-        alpha = layer_rgba.getchannel("A")
-        return alpha if alpha.getbbox() else None
-
-    def _per_layer_inpaint(self, image: Image.Image, mask: Image.Image, frame: InpaintFrame) -> Image.Image:
-        """Per-layer strategy: inpaint each layer in its own SDXL-resolution crop, back-to-front."""
-        from ..render.resolution import optimal_sdxl_resolution
-
-        output = image.copy()
-        padding = frame.layer_bbox_padding
-        w, h = frame.width, frame.height
-
-        # Process bottom-to-top so upper prompt regions refine over lower ones.
-        conditions = sorted(frame.layer_conditions, key=lambda item: item.z_index if item.z_index is not None else 0)
-        for layer_cond in conditions:
-            prompt = layer_cond.prompt.strip() or frame.prompt.strip()
-            if not prompt:
-                continue
-            layer_mask = self._per_layer_condition_mask(layer_cond, w, h)
-            if layer_mask is None:
-                continue
-            box = layer_mask.getbbox()
-            if box is None:
-                continue
-
-            x0, y0, x1, y1 = box
-            x0 = max(0, x0 - padding)
-            y0 = max(0, y0 - padding)
-            x1 = min(w, x1 + padding)
-            y1 = min(h, y1 + padding)
-            bw, bh = x1 - x0, y1 - y0
-            if bw < 8 or bh < 8:
-                continue
-
-            sdxl_w, sdxl_h = optimal_sdxl_resolution(bw, bh)
-
-            crop_image = output.crop((x0, y0, x1, y1)).resize((sdxl_w, sdxl_h), Image.Resampling.LANCZOS)
-            crop_mask_raw = layer_mask.crop((x0, y0, x1, y1))
-            crop_mask = crop_mask_raw.resize((sdxl_w, sdxl_h), Image.Resampling.LANCZOS)
-
-            # Any white pixel in crop_mask means "re-denoise here"; skip if mask is blank
-            import numpy as _np
-            if _np.array(crop_mask).max() == 0:
-                continue
-
-            overrides: dict = {
-                "width": sdxl_w,
-                "height": sdxl_h,
-                "prompt": prompt,
-                "negative_prompt": layer_cond.negative_prompt.strip() or frame.negative_prompt,
-                "strength": layer_cond.denoise if layer_cond.denoise is not None else frame.strength,
-                "layer_conditions": [],
-                "render_strategy": "single",
-            }
-            if layer_cond.cfg is not None:
-                overrides["cfg"] = layer_cond.cfg
-            if layer_cond.steps is not None:
-                overrides["steps"] = layer_cond.steps
-            if layer_cond.sampler:
-                overrides["sampler"] = layer_cond.sampler
-            if layer_cond.scheduler:
-                overrides["scheduler"] = layer_cond.scheduler
-
-            layer_frame = frame.model_copy(update=overrides)
-            try:
-                crop_result = self._diffusers_inpaint(crop_image, crop_mask, layer_frame)
-            except Exception:
-                logger.exception("per_layer: inpaint failed for layer %s", layer_cond.layer_id)
-                continue
-
-            result_back = crop_result.resize((bw, bh), Image.Resampling.LANCZOS).convert("RGB")
-            paste_mask = crop_mask_raw.resize((bw, bh), Image.Resampling.LANCZOS)
-            base_crop = output.crop((x0, y0, x1, y1)).convert("RGB")
-            output.paste(Image.composite(result_back, base_crop, paste_mask), (x0, y0))
-
-        return output
-
-    def _tiled_inpaint(self, image: Image.Image, mask: Image.Image, frame: InpaintFrame) -> Image.Image:
-        """Tiled strategy: inpaint SDXL-resolution grid tiles with cosine-feathered blending."""
-        import numpy as _np
-        from math import ceil
-        from ..render.resolution import optimal_sdxl_resolution, cosine_tile_weight
-
-        n = max(1, frame.tile_divisions)
-        overlap = max(0, frame.tile_overlap)
-        w, h = frame.width, frame.height
-
-        result_acc = _np.zeros((h, w, 3), dtype=_np.float32)
-        weight_acc = _np.zeros((h, w, 1), dtype=_np.float32)
-
-        tile_base_w = ceil(w / n)
-        tile_base_h = ceil(h / n)
-
-        for row in range(n):
-            for col in range(n):
-                x0 = max(0, col * tile_base_w - overlap)
-                y0 = max(0, row * tile_base_h - overlap)
-                x1 = min(w, (col + 1) * tile_base_w + overlap)
-                y1 = min(h, (row + 1) * tile_base_h + overlap)
-                tw, th = x1 - x0, y1 - y0
-                if tw < 8 or th < 8:
-                    continue
-
-                sdxl_w, sdxl_h = optimal_sdxl_resolution(tw, th)
-
-                crop_image = image.crop((x0, y0, x1, y1)).resize((sdxl_w, sdxl_h), Image.Resampling.LANCZOS)
-                crop_mask_raw = mask.crop((x0, y0, x1, y1))
-                crop_mask  = crop_mask_raw.resize((sdxl_w, sdxl_h), Image.Resampling.LANCZOS)
-
-                # Skip tiles with no masked region — no diffusion needed there
-                if _np.array(crop_mask_raw.convert("L")).max() == 0:
-                    tile_result = crop_image
-                else:
-                    tile_frame = frame.model_copy(update={
-                        "width": sdxl_w, "height": sdxl_h,
-                        "layer_conditions": [], "render_strategy": "single",
-                    })
-                    try:
-                        tile_result = self._diffusers_inpaint(crop_image, crop_mask, tile_frame)
-                    except Exception:
-                        logger.exception("tiled: inpaint failed for tile (%d,%d)", row, col)
-                        tile_result = crop_image  # fall back to unmodified crop
-
-                tile_rgb = _np.array(tile_result.resize((tw, th), Image.Resampling.LANCZOS).convert("RGB"), dtype=_np.float32)
-                weight_img = cosine_tile_weight(tw, th)
-                weight_arr = (_np.array(weight_img, dtype=_np.float32) / 255.0)[:, :, _np.newaxis]
-
-                result_acc[y0:y1, x0:x1] += tile_rgb * weight_arr
-                weight_acc[y0:y1, x0:x1] += weight_arr
-
-        weight_acc = _np.maximum(weight_acc, 1e-8)
-        result_arr = (result_acc / weight_acc).clip(0, 255).astype(_np.uint8)
-        return Image.fromarray(result_arr, "RGB")
 
     def _diffusers_inpaint(self, image: Image.Image, mask: Image.Image, frame: InpaintFrame) -> Image.Image:
         import torch

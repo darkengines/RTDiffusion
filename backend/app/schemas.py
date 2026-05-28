@@ -165,10 +165,6 @@ class InpaintFrame(BaseModel):
     transparent_alpha_blur: float = Field(default=1.5, ge=0.0, le=24.0)
     transparent_alpha_threshold: int = Field(default=10, ge=0, le=255)
     layer_conditions: list[LayerCondition] = Field(default_factory=list, max_length=16)
-    render_strategy: str = Field(default="single", max_length=32)
-    tile_divisions: int = Field(default=2, ge=1, le=8)
-    tile_overlap: int = Field(default=128, ge=0, le=512)
-    layer_bbox_padding: int = Field(default=64, ge=0, le=256)
 
     # ── v2 layer wire format (additive; Phase 3 will gut the legacy fields
     # above once engines consume RenderPlan). The frontend aggregates the

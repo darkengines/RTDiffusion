@@ -1905,10 +1905,6 @@ class InpaintSession:
                 transparent_alpha_blur=float(settings.get("transparent_alpha_blur", 1.5)),
                 transparent_alpha_threshold=int(settings.get("transparent_alpha_threshold", 10)),
                 layer_conditions=materialized_conditions,
-                render_strategy=str(settings.get("render_strategy") or "single"),
-                tile_divisions=int(settings.get("tile_divisions") or 2),
-                tile_overlap=int(settings.get("tile_overlap") or 128),
-                layer_bbox_padding=int(settings.get("layer_bbox_padding") or 64),
             )
             mark_timing("request_build_ms", stage_started)
             session = get_diffusers_session(frame.device)
