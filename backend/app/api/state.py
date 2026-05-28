@@ -149,6 +149,81 @@ def remove_system_task(task_id: str) -> None:
         system_tasks.pop(task_id, None)
 
 
+def _prune_completed_system_tasks(now: float | None = None) -> None:
+    current = now if now is not None else _time.monotonic()
+    expired = [
+        tid for tid, task in system_tasks.items()
+        if task.get("status") in {"complete", "error"}
+        and current - (task.get("_completed_at") or current) > 5.0
+    ]
+    for tid in expired:
+        del system_tasks[tid]
+
+
+def active_system_tasks_snapshot() -> list[dict]:
+    """Active system tasks plus transient inpaint-step progress entries."""
+    now = _time.monotonic()
+    with system_task_lock:
+        _prune_completed_system_tasks(now)
+        result = [
+            {k: v for k, v in task.items() if not k.startswith("_")}
+            for task in system_tasks.values()
+        ]
+    for engine in list(_engines.values()):
+        info = engine.inpaint_step_info
+        if info.get("active") and info.get("total", 0) > 0:
+            device = str(info.get("device", "cuda"))
+            step = int(info.get("step", 0))
+            total = max(1, int(info.get("total", 1)))
+            result.append({
+                "task_id": f"sys_inpaint_{device.replace(':', '_')}",
+                "type": "inpaint",
+                "status": "running",
+                "phase": "rendering",
+                "progress": round(step / total, 3),
+                "message": f"Step {step}/{total}",
+            })
+    return result
+
+
+def snapshot_runtime_metrics() -> dict[str, object]:
+    """Collect a consistent backend runtime snapshot for the terminal dashboard."""
+    from ..rtc import _shared_session_manager
+    from ..rtc.router import _peer_connections
+    from ..rtc.session import _peer_sessions
+
+    with layer_task_lock:
+        layer = [task.model_dump() for task in layer_tasks.values()]
+    with motion_task_lock:
+        motion = [task.model_dump() for task in motion_tasks.values()]
+
+    connected_ids = set(_peer_connections.keys())
+    sessions = []
+    for session in list(_peer_sessions.values()):
+        snapshot = session.telemetry_snapshot()
+        snapshot["connection_kind"] = "webrtc" if snapshot.get("session_id") in connected_ids else "websocket"
+        sessions.append(snapshot)
+
+    return {
+        "engine_mode": engine_mode(),
+        "stream_build": {
+            "phase": _shared_session_manager.build_phase,
+            "progress": float(_shared_session_manager.build_progress),
+            "message": _shared_session_manager.build_message,
+        },
+        "connections": {
+            "sessions": sessions,
+            "session_count": len(sessions),
+            "webrtc_count": len(connected_ids),
+        },
+        "tasks": {
+            "system": active_system_tasks_snapshot(),
+            "layer": layer,
+            "motion": motion,
+        },
+    }
+
+
 def on_stream_session_build(phase: str, progress: float, message: str) -> None:
     task_id = "sys_stream_build"
     if phase == "ready":
@@ -166,11 +241,6 @@ def on_stream_session_build(phase: str, progress: float, message: str) -> None:
 def set_layer_task(progress: LayerTaskProgress) -> None:
     with layer_task_lock:
         layer_tasks[progress.task_id] = progress
-    print(
-        f"[layer-task {progress.task_id[:8]}] {progress.status} {progress.progress * 100:5.1f}% "
-        f"{progress.phase}: {progress.error or progress.message}",
-        flush=True,
-    )
 
 
 def get_layer_task(task_id: str) -> LayerTaskProgress | None:
@@ -181,11 +251,6 @@ def get_layer_task(task_id: str) -> LayerTaskProgress | None:
 def set_motion_task(progress: MotionTaskProgress) -> None:
     with motion_task_lock:
         motion_tasks[progress.task_id] = progress
-    print(
-        f"[motion-task {progress.task_id[:8]}] {progress.status} {progress.progress * 100:5.1f}% "
-        f"{progress.phase}: {progress.error or progress.message}",
-        flush=True,
-    )
 
 
 def get_motion_task(task_id: str) -> MotionTaskProgress | None:

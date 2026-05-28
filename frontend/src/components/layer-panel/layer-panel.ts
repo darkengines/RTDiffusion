@@ -110,37 +110,31 @@ export class RtdLayerPanel extends LitElement {
     ></rtd-number>`
   }
 
-  private renderRegionForceRow(
-    label: 'CFG' | 'Denoise',
-    value: number,
-    inherited: boolean,
-    onValue: (value: number) => void,
-    onInherited: (value: boolean) => void,
+  private renderMaskActionControls(
+    layerId: string,
+    channel: Extract<MaskChannel, 'color' | 'cfg' | 'denoise'>,
+    regionId?: string,
+    options: { includePaint?: boolean; includeFit?: boolean } = {},
   ): TemplateResult {
-    const isCfg = label === 'CFG'
-    return html`<div class="mask-force-row">
-      ${this.numCtrl(label, value, isCfg ? 0 : 0, isCfg ? 30 : 0.999, isCfg ? 0.1 : 0.01, isCfg ? 1 : 2, onValue, inherited)}
-      <label class="check-field inherit-check">
-        <input type="checkbox" .checked=${inherited} @change=${(e: Event) => onInherited((e.target as HTMLInputElement).checked)} />
-        <span>inherit</span>
-      </label>
-    </div>`
-  }
-
-  private renderMaskActionControls(layerId: string, channel: Extract<MaskChannel, 'color' | 'cfg' | 'denoise'>, regionId?: string): TemplateResult {
+    const includePaint = options.includePaint ?? true
+    const includeFit = options.includeFit ?? true
     const fitValue = clamp(this.fitAlphaValue, 0, 1, 1)
     const fillValue = clamp(this.fillViewportValue, 0, 1, 1)
-    return html`<div class="button-grid mask-action-grid">
-      <button @click=${() => this.emit('rtd-mask-select', { layerId, regionId: regionId ?? `special:${channel}:${layerId}`, channel })}>Paint</button>
+    return html`<div class="button-grid mask-action-grid compact-mask-actions">
+      ${includePaint
+        ? html`<button class="small-btn" @click=${() => this.emit('rtd-mask-select', { layerId, regionId: regionId ?? `special:${channel}:${layerId}`, channel })}>Paint</button>`
+        : ''}
+      ${includeFit
+        ? html`<div class="mask-action">
+            <button class="small-btn" @click=${() => this.emit('rtd-layer-channel-fit-alpha', { id: layerId, channel, regionId, value: fitValue })}>Fit to RGB alpha</button>
+            ${this.numCtrl('', fitValue, 0, 1, 0.01, 2, (v) => { this.fitAlphaValue = clamp(v, 0, 1, this.fitAlphaValue) })}
+          </div>`
+        : ''}
       <div class="mask-action">
-        <button @click=${() => this.emit('rtd-layer-channel-fit-alpha', { id: layerId, channel, regionId, value: fitValue })}>Fit to RGB alpha</button>
-        ${this.numCtrl('', fitValue, 0, 1, 0.01, 2, (v) => { this.fitAlphaValue = clamp(v, 0, 1, this.fitAlphaValue) })}
-      </div>
-      <div class="mask-action">
-        <button @click=${() => this.emit('rtd-mask-fill-viewport', { layerId, channel, regionId, value: fillValue })}>Fill viewport</button>
+        <button class="small-btn" @click=${() => this.emit('rtd-mask-fill-viewport', { layerId, channel, regionId, value: fillValue })}>Fill viewport</button>
         ${this.numCtrl('', fillValue, 0, 1, 0.01, 2, (v) => { this.fillViewportValue = clamp(v, 0, 1, this.fillViewportValue) })}
       </div>
-      <button @click=${() => this.emit('rtd-mask-clear', { layerId, channel, regionId })}>Clear</button>
+      <button class="small-btn" @click=${() => this.emit('rtd-mask-clear', { layerId, channel, regionId })}>Clear</button>
     </div>`
   }
 
@@ -649,16 +643,6 @@ export class RtdLayerPanel extends LitElement {
   }
 
   private renderRgbaMaskCard(layer: LayerItem): TemplateResult {
-    const sc = this._scene.value
-    const promptInherited = layer.preset.rgbaPromptInherited ?? true
-    const negativePromptInherited = layer.preset.rgbaNegativePromptInherited ?? true
-    const denoiseInherited = layer.preset.rgbaDenoiseInherited ?? true
-    const cfgInherited = layer.preset.rgbaCfgInherited ?? true
-    const weightInherited = layer.preset.rgbaWeightInherited ?? true
-    const blendingInherited = layer.preset.rgbaBlendingInherited ?? true
-    const blendingEnabled = blendingInherited ? true : (layer.preset.rgbaMaskBlendingEnabled ?? false)
-    const blendingRadius = blendingInherited ? 32 : (layer.preset.rgbaMaskBlendingRadius ?? 32)
-    const blendingStrength = blendingInherited ? 1 : (layer.preset.rgbaMaskBlendingStrength ?? 1)
     return html`<section class="region-card rgba-mask-card">
       <div class="region-head">
         <button class="region-color region-color-button rgba-mask-icon" style="--region-color: #63d297" title="Paint RGBA mask"
@@ -666,63 +650,12 @@ export class RtdLayerPanel extends LitElement {
         <input .value=${'RGBA mask'} disabled />
       </div>
       <div class="region-meta">Spatial RGBA input mask · move, scale, rotate, paint, or load image pixels</div>
-      <label class="field">
-        <span>Prompt</span>
-        <textarea rows="2" .value=${promptInherited ? sc.prompt : layer.preset.prompt} ?disabled=${promptInherited}
-          @input=${(e: Event) => this.emit('rtd-layer-preset', { id: layer.id, patch: { prompt: (e.target as HTMLTextAreaElement).value, rgbaPromptInherited: false } })}></textarea>
-      </label>
-      <label class="check-field inherit-check">
-        <input type="checkbox" .checked=${promptInherited}
-          @change=${(e: Event) => this.emit('rtd-layer-preset', { id: layer.id, patch: { rgbaPromptInherited: (e.target as HTMLInputElement).checked } })} />
-        <span>inherit prompt</span>
-      </label>
-      <label class="field">
-        <span>Negative prompt</span>
-        <textarea rows="2" .value=${negativePromptInherited ? sc.negativePrompt : layer.preset.negativePrompt} ?disabled=${negativePromptInherited}
-          @input=${(e: Event) => this.emit('rtd-layer-preset', { id: layer.id, patch: { negativePrompt: (e.target as HTMLTextAreaElement).value, rgbaNegativePromptInherited: false } })}></textarea>
-      </label>
-      <label class="check-field inherit-check">
-        <input type="checkbox" .checked=${negativePromptInherited}
-          @change=${(e: Event) => this.emit('rtd-layer-preset', { id: layer.id, patch: { rgbaNegativePromptInherited: (e.target as HTMLInputElement).checked } })} />
-        <span>inherit negative</span>
-      </label>
-      <div class="mask-force-grid">
-        ${this.numCtrl('Denoise', denoiseInherited ? sc.strength : layer.preset.strength, 0, 0.999, 0.01, 2,
-          (v) => this.emit('rtd-layer-preset', { id: layer.id, patch: { strength: clamp(v, 0, 0.999, layer.preset.strength), rgbaDenoiseInherited: false } }), denoiseInherited)}
-        ${this.numCtrl('CFG', cfgInherited ? sc.cfg : (layer.preset.layerCfg ?? layer.preset.cfg), 0, 30, 0.1, 1,
-          (v) => this.emit('rtd-layer-preset', { id: layer.id, patch: { layerCfg: clamp(v, 0, 30, layer.preset.layerCfg ?? layer.preset.cfg), rgbaCfgInherited: false } }), cfgInherited)}
-        ${this.numCtrl('Weight', weightInherited ? 1 : layer.preset.conditionWeight, 0, 4, 0.05, 2,
-          (v) => this.emit('rtd-layer-preset', { id: layer.id, patch: { conditionWeight: clamp(v, 0, 4, layer.preset.conditionWeight), rgbaWeightInherited: false } }), weightInherited)}
-      </div>
-      <div class="mask-force-grid inherit-grid">
-        <label class="check-field inherit-check"><input type="checkbox" .checked=${denoiseInherited}
-          @change=${(e: Event) => this.emit('rtd-layer-preset', { id: layer.id, patch: { rgbaDenoiseInherited: (e.target as HTMLInputElement).checked } })} /><span>inherit denoise</span></label>
-        <label class="check-field inherit-check"><input type="checkbox" .checked=${cfgInherited}
-          @change=${(e: Event) => this.emit('rtd-layer-preset', { id: layer.id, patch: { rgbaCfgInherited: (e.target as HTMLInputElement).checked } })} /><span>inherit CFG</span></label>
-        <label class="check-field inherit-check"><input type="checkbox" .checked=${weightInherited}
-          @change=${(e: Event) => this.emit('rtd-layer-preset', { id: layer.id, patch: { rgbaWeightInherited: (e.target as HTMLInputElement).checked } })} /><span>inherit weight</span></label>
-      </div>
       <div class="button-grid mask-action-grid rgba-mask-actions">
-        <button @click=${() => this.emit('rtd-rgba-mask-load', { layerId: layer.id })}>Load image</button>
-        <button @click=${() => this.emit('rtd-mask-select', { layerId: layer.id, channel: 'color' as MaskChannel })}>Paint</button>
+        <button class="small-btn" @click=${() => this.emit('rtd-rgba-mask-load', { layerId: layer.id })}>Load image</button>
+        <button class="small-btn" @click=${() => this.emit('rtd-mask-select', { layerId: layer.id, channel: 'color' as MaskChannel })}>Paint</button>
       </div>
-      ${this.renderMaskActionControls(layer.id, 'color')}
-      <label class="check-field">
-        <input type="checkbox" .checked=${blendingEnabled} ?disabled=${blendingInherited}
-          @change=${(e: Event) => this.emit('rtd-layer-preset', { id: layer.id, patch: { rgbaMaskBlendingEnabled: (e.target as HTMLInputElement).checked, rgbaBlendingInherited: false } })} />
-        <span>Blending</span>
-      </label>
-      <label class="check-field inherit-check">
-        <input type="checkbox" .checked=${blendingInherited}
-          @change=${(e: Event) => this.emit('rtd-layer-preset', { id: layer.id, patch: { rgbaBlendingInherited: (e.target as HTMLInputElement).checked } })} />
-        <span>inherit blending</span>
-      </label>
-      ${blendingEnabled ? html`<div class="resolution-grid">
-        ${this.numCtrl('Radius', blendingRadius, -160, 160, 1, 0,
-          (v) => this.emit('rtd-layer-preset', { id: layer.id, patch: { rgbaMaskBlendingRadius: Math.round(clamp(v, -160, 160, blendingRadius)), rgbaBlendingInherited: false } }), blendingInherited)}
-        ${this.numCtrl('Strength', blendingStrength, 0, 4, 0.05, 2,
-          (v) => this.emit('rtd-layer-preset', { id: layer.id, patch: { rgbaMaskBlendingStrength: clamp(v, 0, 4, blendingStrength), rgbaBlendingInherited: false } }), blendingInherited)}
-      </div>` : ''}
+      ${this.renderMaskActionControls(layer.id, 'color', undefined, { includePaint: false, includeFit: false })}
+
     </section>`
   }
 
@@ -732,12 +665,6 @@ export class RtdLayerPanel extends LitElement {
     const description = channel === 'cfg'
       ? 'Layer-wide fine tuning · transparent by default · overrides regular CFG weights'
       : 'Layer-wide fine tuning · transparent by default · overrides regular denoise weights'
-    const enabledKey = channel === 'cfg' ? 'cfgMaskBlendingEnabled' : 'denoiseMaskBlendingEnabled'
-    const radiusKey = channel === 'cfg' ? 'cfgMaskBlendingRadius' : 'denoiseMaskBlendingRadius'
-    const strengthKey = channel === 'cfg' ? 'cfgMaskBlendingStrength' : 'denoiseMaskBlendingStrength'
-    const blendingEnabled = layer.preset[enabledKey] ?? false
-    const blendingRadius = layer.preset[radiusKey] ?? 32
-    const blendingStrength = layer.preset[strengthKey] ?? 1
     return html`<section class="region-card special-mask-card">
       <div class="region-head">
         <button class="region-color region-color-button" style=${`--region-color: ${color}`}
@@ -747,17 +674,6 @@ export class RtdLayerPanel extends LitElement {
       </div>
       <div class="region-meta">${description}</div>
       ${this.renderMaskActionControls(layer.id, channel)}
-      <label class="check-field">
-        <input type="checkbox" .checked=${blendingEnabled}
-          @change=${(e: Event) => this.emit('rtd-layer-preset', { id: layer.id, patch: { [enabledKey]: (e.target as HTMLInputElement).checked } })} />
-        <span>Blending</span>
-      </label>
-      ${blendingEnabled ? html`<div class="resolution-grid">
-        ${this.numCtrl('Radius', blendingRadius, -160, 160, 1, 0,
-          (v) => this.emit('rtd-layer-preset', { id: layer.id, patch: { [radiusKey]: Math.round(clamp(v, -160, 160, blendingRadius)) } }))}
-        ${this.numCtrl('Strength', blendingStrength, 0, 4, 0.05, 2,
-          (v) => this.emit('rtd-layer-preset', { id: layer.id, patch: { [strengthKey]: clamp(v, 0, 4, blendingStrength) } }))}
-      </div>` : ''}
     </section>`
   }
 
@@ -794,37 +710,7 @@ export class RtdLayerPanel extends LitElement {
                 <textarea rows="2" .value=${region.negativePrompt}
                   @input=${(e: Event) => this.emit('rtd-region-update', { id: region.id, patch: { negativePrompt: (e.target as HTMLTextAreaElement).value, inherited: false } })}></textarea>
               </label>
-              <label class="check-field">
-                <input type="checkbox" .checked=${region.blendingEnabled ?? true}
-                  @change=${(e: Event) => this.emit('rtd-region-update', { id: region.id, patch: { blendingEnabled: (e.target as HTMLInputElement).checked, inherited: false } })} />
-                <span>Blending</span>
-              </label>
-              ${region.blendingEnabled ?? true ? html`
-                <div class="resolution-grid">
-                  ${this.numCtrl('Radius', region.blendingRadius ?? 32, -160, 160, 1, 0,
-                    (v) => this.emit('rtd-region-update', { id: region.id, patch: { blendingRadius: Math.round(clamp(v, -160, 160, region.blendingRadius ?? 32)), inherited: false } }))}
-                  ${this.numCtrl('Strength', region.blendingStrength ?? 1, 0, 4, 0.05, 2,
-                    (v) => this.emit('rtd-region-update', { id: region.id, patch: { blendingStrength: clamp(v, 0, 4, region.blendingStrength ?? 1), inherited: false } }))}
-                </div>
-              ` : ''}
-              ${target === 'layer' ? html`
-                <div class="mask-force-grid">
-                  ${this.renderRegionForceRow(
-                    'CFG',
-                    region.regionCfg ?? this._scene.value.cfg,
-                    region.cfgMaskInherited ?? true,
-                    (v) => this.emit('rtd-region-update', { id: region.id, patch: { regionCfg: clamp(v, 0, 30, region.regionCfg ?? this._scene.value.cfg), inherited: false, cfgMaskInherited: false } }),
-                    (value) => this.emit('rtd-region-update', { id: region.id, patch: { cfgMaskInherited: value } }),
-                  )}
-                  ${this.renderRegionForceRow(
-                    'Denoise',
-                    region.denoise ?? this._scene.value.strength,
-                    region.denoiseMaskInherited ?? true,
-                    (v) => this.emit('rtd-region-update', { id: region.id, patch: { denoise: clamp(v, 0, 0.999, region.denoise ?? this._scene.value.strength), inherited: false, denoiseMaskInherited: false } }),
-                    (value) => this.emit('rtd-region-update', { id: region.id, patch: { denoiseMaskInherited: value } }),
-                  )}
-                </div>
-              ` : ''}
+
             </section>`)}
           </div>`
         : html`<div class="variation-empty empty">No named masks yet</div>`}
@@ -1146,13 +1032,19 @@ export class RtdLayerPanel extends LitElement {
     }
 
     .mask-action-grid {
-      grid-template-columns: repeat(auto-fit, minmax(126px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(92px, 1fr));
       align-items: stretch;
+    }
+
+    .compact-mask-actions .small-btn {
+      min-height: 22px;
+      padding: 1px 6px;
+      font-size: 11px;
     }
 
     .mask-action {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) 58px;
+      grid-template-columns: minmax(0, 1fr) 52px;
       min-width: 0;
     }
 

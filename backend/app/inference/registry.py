@@ -54,7 +54,7 @@ def _z_image_caps() -> RendererCaps:
         transport="websocket-binary-image",
         runtime="diffusers",
         native=True,
-        notes="Z-Image renderer streamed over binary WebSocket.",
+        notes="Z-Image renderer streamed over binary WebSocket. Regional prompting currently uses text-layout guidance; per-pixel CFG-map guidance and ControlNet are not supported.",
     )
 
 

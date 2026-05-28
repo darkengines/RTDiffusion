@@ -39,10 +39,6 @@ def _result_for_frame(frame: InpaintFrame, result: InpaintResult) -> InpaintResu
     )
 
 
-def _can_reuse_scene_result(frame: InpaintFrame, last_scene_id: str, last_scene_result: InpaintResult | None) -> bool:
-    return (not frame.stream_diffusion) and bool(frame.scene_id) and frame.scene_id == last_scene_id and last_scene_result is not None
-
-
 async def _receive_latest_frame(websocket: WebSocket) -> dict:
     """Block until at least one frame arrives, then drain any additional queued frames."""
     payload = await websocket.receive_json()
@@ -69,7 +65,7 @@ async def inpaint_socket(websocket: WebSocket) -> None:
             try:
                 frame = InpaintFrame.model_validate(payload)
                 _state.latest_sampling_frame = frame
-                if _can_reuse_scene_result(frame, last_scene_id, last_scene_result):
+                if frame.allows_scene_result_reuse() and frame.scene_id == last_scene_id and last_scene_result is not None:
                     result = _result_for_frame(frame, last_scene_result)
                 elif sampling_pause_event.is_set():
                     result = InpaintResult(

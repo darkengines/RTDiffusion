@@ -24,7 +24,7 @@ from app.inference import (
     WarmupHint,
 )
 from app.stream.manager import SessionManager, _session_sig
-from app.stream.session import _denoise_map_fingerprint
+from app.stream.session import _denoise_map_fingerprint, _latent_source_image
 
 
 class _FakeStream:
@@ -265,6 +265,18 @@ def test_layer_region_prompts_preserve_region_cfg_scale() -> None:
     assert fake._s["cfg_scale"] == pytest.approx(3.0)
 
 
+def test_single_pass_uses_request_cfg_scale_and_restores_stream_state() -> None:
+    fake = _FakeCfgStream()
+    session = StreamInferenceSession(fake)
+    req = _request(prompt_override="room")
+    req.sampler = SamplerSpec(cfg=6.5)
+
+    session.step(req)
+
+    assert fake.calls[0]["cfg_scale"] == pytest.approx(6.5)
+    assert fake._s["cfg_scale"] == pytest.approx(3.0)
+
+
 def test_denoise_map_fingerprint_distinguishes_sparse_regions() -> None:
     mask_a = Image.new("L", (832, 1216), 0)
     mask_b = Image.new("L", (832, 1216), 0)
@@ -272,6 +284,14 @@ def test_denoise_map_fingerprint_distinguishes_sparse_regions() -> None:
     mask_b.putpixel((641, 287), 255)
 
     assert _denoise_map_fingerprint(mask_a) != _denoise_map_fingerprint(mask_b)
+
+
+def test_latent_source_prefers_previous_rendered_output() -> None:
+    current = Image.new("RGB", (32, 32), (200, 150, 100))
+    previous = Image.new("RGB", (32, 32), (10, 20, 30))
+
+    assert _latent_source_image(current, None) is current
+    assert _latent_source_image(current, previous) is previous
 
 
 def test_layer_regions_use_isolated_latent_buffers() -> None:

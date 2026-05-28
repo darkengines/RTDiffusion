@@ -34,6 +34,8 @@ let _webRtcSceneRequestVersion = 0
 let _webRtcLayerConditionsDirty = false
 let _webRtcResourceRequestVersion = 0
 let _webRtcResourceSentVersion = 0
+let _webRtcForceInputRevision = false
+let _webRtcPendingLiveInputUpdate = false
 let _webRtcSceneScheduled = false
 let _webRtcInputReady = false
 let _webRtcSeedRotationTimer: number | undefined
@@ -52,6 +54,20 @@ let _inpaintSendRequested = false
 let _inpaintRetryTimer: number | undefined
 let _lastWorkingModel = ''
 let _lastWorkingLoras: string[] = []
+let _streamStatePassInputSeq = 0
+let _streamStatePassCount = 0
+
+type RealtimeEventKind = 'settings' | 'liveInput' | 'layerConditions' | 'resources'
+type RealtimeFrameUpdateOptions = { refreshResources?: boolean; refreshLayerConditions?: boolean; liveInputChanged?: boolean }
+type RealtimeEventState = { lastAt: number; timer: number | undefined; pending: RealtimeFrameUpdateOptions | undefined }
+
+const _REALTIME_EVENT_DEBOUNCE_MS = 33
+const _realtimeEventStates: Record<RealtimeEventKind, RealtimeEventState> = {
+  settings: { lastAt: 0, timer: undefined, pending: undefined },
+  liveInput: { lastAt: 0, timer: undefined, pending: undefined },
+  layerConditions: { lastAt: 0, timer: undefined, pending: undefined },
+  resources: { lastAt: 0, timer: undefined, pending: undefined },
+}
 
 function _applyOutputTimings(timings: StreamTimingMap | undefined) {
   $stream.setKey('outputTimings', timings && typeof timings === 'object' ? { ...timings } : {})
@@ -104,12 +120,13 @@ function _scheduleInpaintFrameSend(delayMs: number) {
   }, Math.max(0, delayMs))
 }
 
-export function requestWebRtcSettingsUpdate() {
+export function requestWebRtcSettingsUpdate(forceInputRevision = false) {
   if (!_webRtcPcId) return
   if ($scene.get().seedRotationMode !== 'off' && _webRtcSeedRotationLastAt <= 0) {
     _webRtcSeedRotationPending = true
     _webRtcSeedRotationSerial++
   }
+  _webRtcForceInputRevision ||= forceInputRevision
   _webRtcSceneRequestVersion++
   _webRtcResourceRequestVersion++
   _webRtcSceneDirty = true
@@ -119,33 +136,34 @@ export function requestWebRtcSettingsUpdate() {
 export function requestWebRtcLiveInputUpdate() {
   if (!_webRtcPcId) return
   if (!_webRtcLastSceneObject) {
-    requestWebRtcSettingsUpdate()
+    requestWebRtcSettingsUpdate(true)
     return
   }
-  if (_webRtcSceneDirty || _sendingWebRtcScene || _webRtcWaitingForResourceBackpressure) return
+  _webRtcPendingLiveInputUpdate = true
+  if (!_webRtcInputReady || _webRtcSceneDirty || _sendingWebRtcScene || _webRtcWaitingForResourceBackpressure) return
   if ($scene.get().seedRotationMode !== 'off' && _webRtcSeedRotationLastAt <= 0) {
     _webRtcSeedRotationPending = true
     _webRtcSeedRotationSerial++
   }
+  _webRtcPendingLiveInputUpdate = false
+  _webRtcForceInputRevision = true
   _webRtcSceneRequestVersion++
   _webRtcSceneDirty = true
   _scheduleWebRtcSceneSend()
 }
 
-export function requestWebRtcLayerConditionsUpdate() {
+export function requestWebRtcLayerConditionsUpdate(forceInputRevision = false) {
   if (!_webRtcPcId) return
   if (!_webRtcLastSceneObject) {
-    requestWebRtcSettingsUpdate()
+    requestWebRtcSettingsUpdate(forceInputRevision)
     return
   }
   if ($scene.get().seedRotationMode !== 'off' && _webRtcSeedRotationLastAt <= 0) {
     _webRtcSeedRotationPending = true
     _webRtcSeedRotationSerial++
   }
+  _webRtcForceInputRevision ||= forceInputRevision
   _webRtcSceneRequestVersion++
-  // Layer condition edits may carry new mask/image resources; force a
-  // resource refresh so the backend doesn't keep old refs.
-  _webRtcResourceRequestVersion++
   _webRtcLayerConditionsDirty = true
   _webRtcSceneDirty = true
   _scheduleWebRtcSceneSend()
@@ -160,14 +178,62 @@ export function requestWebRtcSceneSettingsPatch() {
   void _sendWebRtcSceneSettingsPatch()
 }
 
-export function requestRealtimeFrameUpdate(options: { refreshResources?: boolean; refreshLayerConditions?: boolean } = {}) {
+function _dispatchRealtimeFrameUpdateNow(options: RealtimeFrameUpdateOptions = {}) {
   if (_webRtcPcId) {
-    if (options.refreshResources) requestWebRtcSettingsUpdate()
-    else if (options.refreshLayerConditions) requestWebRtcLayerConditionsUpdate()
-    else requestWebRtcLiveInputUpdate()
+    const forceInputRevision = !!options.liveInputChanged
+    if (options.refreshResources) requestWebRtcSettingsUpdate(forceInputRevision)
+    else if (options.refreshLayerConditions) requestWebRtcLayerConditionsUpdate(forceInputRevision)
+    else if (forceInputRevision) requestWebRtcLiveInputUpdate()
+    else requestWebRtcSceneSettingsPatch()
     return
   }
   requestInpaintFrameUpdate()
+}
+
+function _realtimeEventKind(options: RealtimeFrameUpdateOptions): RealtimeEventKind {
+  if (options.refreshResources) return 'resources'
+  if (options.refreshLayerConditions) return 'layerConditions'
+  if (options.liveInputChanged) return 'liveInput'
+  return 'settings'
+}
+
+function _mergeRealtimeFrameUpdateOptions(
+  current: RealtimeFrameUpdateOptions | undefined,
+  incoming: RealtimeFrameUpdateOptions,
+): RealtimeFrameUpdateOptions {
+  return {
+    refreshResources: !!current?.refreshResources || !!incoming.refreshResources,
+    refreshLayerConditions: !!current?.refreshLayerConditions || !!incoming.refreshLayerConditions,
+    liveInputChanged: !!current?.liveInputChanged || !!incoming.liveInputChanged,
+  }
+}
+
+function _flushRealtimeEvent(kind: RealtimeEventKind) {
+  const state = _realtimeEventStates[kind]
+  if (state.timer !== undefined) {
+    window.clearTimeout(state.timer)
+    state.timer = undefined
+  }
+  const pending = state.pending
+  state.pending = undefined
+  state.lastAt = performance.now()
+  _dispatchRealtimeFrameUpdateNow(pending)
+}
+
+export function requestRealtimeFrameUpdate(options: RealtimeFrameUpdateOptions = {}) {
+  if (!_webRtcPcId) {
+    _dispatchRealtimeFrameUpdateNow(options)
+    return
+  }
+  const kind = _realtimeEventKind(options)
+  const state = _realtimeEventStates[kind]
+  state.pending = _mergeRealtimeFrameUpdateOptions(state.pending, options)
+  if (state.timer !== undefined) window.clearTimeout(state.timer)
+  state.timer = window.setTimeout(() => _flushRealtimeEvent(kind), _REALTIME_EVENT_DEBOUNCE_MS)
+}
+
+function _shouldMaintainSignalSurfaces() {
+  return $stream.get().isStreaming || $stream.get().debugStreamsEnabled
 }
 
 function _currentOutputTransport(): 'video' | 'image' {
@@ -206,9 +272,6 @@ async function _ensureWebRtcMediaPlane(sessionId: string, outputTransport: 'vide
   ) {
     if (_webRtcMediaNegotiation) await _webRtcMediaNegotiation.catch(() => undefined)
     return
-  }
-  if (_webRtcMediaPeer) {
-    _webRtcMediaPeer.close()
     _webRtcMediaPeer = undefined
     _webRtcMediaPeerSessionId = ''
     _webRtcMediaPeerOutputTransport = 'video'
@@ -644,6 +707,8 @@ export function startInpaintStream() {
   _inpaintLatestInputSeq = 1
   _inpaintAwaitingSeq = 0
   _inpaintSendRequested = true
+  _streamStatePassInputSeq = 0
+  _streamStatePassCount = 0
   $stream.setKey('status', 'connecting')
 
   ws.onopen = () => {
@@ -707,6 +772,8 @@ export function startInpaintStream() {
     _inpaintLatestInputSeq = 0
     _inpaintAwaitingSeq = 0
     _inpaintSendRequested = false
+    _streamStatePassInputSeq = 0
+    _streamStatePassCount = 0
     if (_inpaintRetryTimer !== undefined) { window.clearTimeout(_inpaintRetryTimer); _inpaintRetryTimer = undefined }
     $stream.setKey('isStreaming', false)
     $stream.setKey('status', 'offline')
@@ -735,6 +802,7 @@ async function _sendInpaintFrame() {
   if (_sendingInpaintFrame) return  // prevent concurrent canvas exports
   const state = $stream.get()
   const streamMode = state.scenePanelTab === 'streamdiffusion'
+  const streamMaxPasses = Math.max(1, Math.round(state.maxPasses || 16))
   // Watchdog: if server never replied within timeout, unblock so frames resume
   if (!streamMode && _awaitingFrame && _awaitingFrameSentMs > 0 &&
       performance.now() - _awaitingFrameSentMs > _AWAIT_FRAME_TIMEOUT_MS) {
@@ -750,6 +818,13 @@ async function _sendInpaintFrame() {
   _sendingInpaintFrame = true
   try {
     const inputSeq = _inpaintLatestInputSeq
+    if (streamMode) {
+      if (_streamStatePassInputSeq !== inputSeq) {
+        _streamStatePassInputSeq = inputSeq
+        _streamStatePassCount = 0
+      }
+      if (_streamStatePassCount >= streamMaxPasses) return
+    }
     const payload = await _exportFullFrame()
     if (!payload) { _awaitingFrame = false; _awaitingFrameSentMs = 0; return }
     const seq = ++_inpaintSeq
@@ -759,13 +834,19 @@ async function _sendInpaintFrame() {
     const packet = _fullFramePacket(payload)
     packet.client_frame_id = seq
     packet.client_input_id = streamMode ? seq : inputSeq
-    const { scene, resources } = await _splitFullFrameIntoScene(packet)
-    packet.scene_id = scene.id
-    void _replaceSceneResourceDebugData(resources, scene)
+    if (_shouldMaintainSignalSurfaces()) {
+      const { scene, resources } = await _splitFullFrameIntoScene(packet)
+      packet.scene_id = scene.id
+      void _replaceSceneResourceDebugData(resources, scene)
+    } else if (_sceneResourceDebugData.size || _sceneResourceDebugMedia.size) {
+      _clearSceneResourceDebugData()
+    }
     if (!streamMode) {
       _awaitingFrame = true
       _awaitingFrameSentMs = performance.now()
       _inpaintAwaitingSeq = seq
+    } else {
+      _streamStatePassCount += 1
     }
     _socket.send(JSON.stringify(packet))
   } finally {
@@ -832,6 +913,7 @@ function _handleRenderSessionMessage(msg: Record<string, unknown>) {
   if (type === 'input_ready') {
     _webRtcInputReady = true
     _maybeRequestWebRtcSeedRotation()
+    if (_webRtcPendingLiveInputUpdate) requestWebRtcLiveInputUpdate()
     _flushWebRtcDirtyScene()
     return
   }
@@ -977,7 +1059,8 @@ async function _sendSceneRtc() {
   const channel = _sessionSocket
   if (!channel || channel.readyState !== WebSocket.OPEN) return
   if (!_webRtcSceneDirty) return
-  if (!_webRtcInputReady && !_canSendSceneWhileBusy()) return
+  const requiresStableReady = $stream.get().scenePanelTab !== 'streamdiffusion' && _webRtcResourceRequestVersion > _webRtcResourceSentVersion
+  if ((!_webRtcInputReady && !_canSendSceneWhileBusy()) || (!_webRtcInputReady && requiresStableReady && !_webRtcForceInputRevision)) return
   if (_sendingWebRtcScene) { _webRtcSceneDirty = true; return }
   if (channel.bufferedAmount > _RTC_RESOURCE_BUFFER_HIGH_BYTES) {
     _webRtcSceneDirty = true
@@ -988,26 +1071,46 @@ async function _sendSceneRtc() {
   _webRtcSceneDirty = false
   _sendingWebRtcScene = true
   const sendVersion = _webRtcSceneRequestVersion
+  const forceInputRevision = _webRtcForceInputRevision
   let sentScene = false
   let sentPatch = false
   const markNewerEditForNextReady = () => {
     if (sendVersion !== _webRtcSceneRequestVersion) _webRtcSceneDirty = true
   }
   try {
-    if (_webRtcLastSceneObject && _webRtcLayerConditionsDirty && !(_webRtcResourceRequestVersion > _webRtcResourceSentVersion)) {
+    if (_webRtcLastSceneObject && _webRtcLayerConditionsDirty && !forceInputRevision && !(_webRtcResourceRequestVersion > _webRtcResourceSentVersion)) {
       sentPatch = await _sendWebRtcSceneSettingsPatch(false, false, true)
       markNewerEditForNextReady()
       return
     }
-    if (_webRtcLastSceneObject && _webRtcLiveInputMediaRegisteredOnce && !_webRtcLiveInputMediaReady) {
+    if (_webRtcLastSceneObject && _webRtcResourceRequestVersion > _webRtcResourceSentVersion && (!forceInputRevision || !_webRtcLiveInputMediaReady)) {
+      sentPatch = await _sendWebRtcSceneSettingsPatch(false, true, _webRtcLayerConditionsDirty)
+      markNewerEditForNextReady()
+      return
+    }
+    if (forceInputRevision && _webRtcLastSceneObject && _webRtcLiveInputMediaRegisteredOnce && !_webRtcLiveInputMediaReady) {
       _webRtcInputReady = true
       _webRtcSceneDirty = true
       window.dispatchEvent(new CustomEvent('rtd:rtc-media-plane-ready', { detail: { sessionId: _webRtcPcId, force: true } }))
       return
     }
-    if (_webRtcLastSceneObject && _webRtcLiveInputMediaReady) {
+    if (forceInputRevision && _webRtcLastSceneObject && !_webRtcLiveInputMediaRegisteredOnce) {
+      // Canvas media track was never set up (e.g. still being negotiated). Fall
+      // back to a direct layer-conditions refresh without input_revision so the
+      // backend still renders the draw update instead of deadlocking on the
+      // sceneId early-return in the full-scene branch below.
+      sentPatch = await _sendWebRtcSceneSettingsPatch(false, _webRtcResourceRequestVersion > _webRtcResourceSentVersion, _webRtcLayerConditionsDirty)
+      markNewerEditForNextReady()
+      return
+    }
+    if (forceInputRevision && _webRtcLastSceneObject && _webRtcLiveInputMediaReady) {
       await _requestWebRtcInputMediaFrame()
-      sentPatch = await _sendWebRtcSceneSettingsPatch(true, _webRtcResourceRequestVersion > _webRtcResourceSentVersion, _webRtcLayerConditionsDirty)
+      sentPatch = await _sendWebRtcSceneSettingsPatch(
+        true,
+        _webRtcResourceRequestVersion > _webRtcResourceSentVersion,
+        _webRtcLayerConditionsDirty,
+        !(_webRtcResourceRequestVersion > _webRtcResourceSentVersion) && !_webRtcLayerConditionsDirty,
+      )
       markNewerEditForNextReady()
       return
     }
@@ -1039,14 +1142,15 @@ async function _sendSceneRtc() {
     if (sceneId && sceneId === _webRtcLastScene) { _webRtcInputReady = true; return }
     _webRtcLastScene = sceneId || JSON.stringify(scene)
     _webRtcLastSceneObject = scene
-    channel.send(JSON.stringify({ type: 'scene', id: sceneId, seq: ++_webRtcSceneSeq, scene }))
     _webRtcResourceSentVersion = _webRtcResourceRequestVersion
+    channel.send(JSON.stringify({ type: 'scene', id: sceneId, seq: ++_webRtcSceneSeq, scene }))
     sentScene = true
   } catch (err) {
     _webRtcInputReady = true
     _webRtcSceneDirty = true
     reportError(err instanceof Error ? err.message : String(err))
   } finally {
+    if (sentScene || sentPatch || !forceInputRevision) _webRtcForceInputRevision = false
     _sendingWebRtcScene = false
     if (!sentScene && !sentPatch) _webRtcInputReady = true
     if (_webRtcSceneDirty && _webRtcInputReady && !_webRtcWaitingForResourceBackpressure) {
@@ -1055,13 +1159,13 @@ async function _sendSceneRtc() {
   }
 }
 
-async function _sendWebRtcSceneSettingsPatch(forceInputRevision = false, refreshResources = false, includeLayerConditions = false): Promise<boolean> {
+async function _sendWebRtcSceneSettingsPatch(forceInputRevision = false, refreshResources = false, includeLayerConditions = false, minimalLiveInputPatch = false): Promise<boolean> {
   const channel = _sessionSocket
   if (!_webRtcPcId || !channel || channel.readyState !== WebSocket.OPEN) return false
   const scene = _webRtcLastSceneObject
   if (!scene) return false
   try {
-    if (refreshResources && (forceInputRevision || includeLayerConditions)) {
+    if (refreshResources) {
       const payload = await _exportFullFrame(_webRtcPcId)
       if (!payload) return false
       const packet = _fullFramePacket(payload)
@@ -1096,17 +1200,17 @@ async function _sendWebRtcSceneSettingsPatch(forceInputRevision = false, refresh
         signals: nextScene.signals,
         layer_conditions: nextScene.layer_conditions,
       } as Record<string, unknown>
+      _webRtcResourceSentVersion = _webRtcResourceRequestVersion
       channel.send(JSON.stringify({
         type: 'scene_patch',
         seq,
         events: _sceneEventsFromPatch(patch),
         patch,
       }))
-      _webRtcResourceSentVersion = _webRtcResourceRequestVersion
       _webRtcLayerConditionsDirty = false
       return true
     }
-    const settings = await _exportSceneSettings()
+    const settings = minimalLiveInputPatch ? {} as Record<string, unknown> : await _exportSceneSettings()
     if (_webRtcSeedRotationPending) {
       settings.seed_mode = $scene.get().seedMode
       settings.seed_rotation_serial = _webRtcSeedRotationSerial
@@ -1121,10 +1225,10 @@ async function _sendWebRtcSceneSettingsPatch(forceInputRevision = false, refresh
     }
     const layerConditions = includeLayerConditions ? await _layerConditionsMetadataPatch(scene) : undefined
     if (includeLayerConditions && !layerConditions) {
-      return _sendWebRtcSceneSettingsPatch(forceInputRevision, true, true)
+      return _sendWebRtcSceneSettingsPatch(forceInputRevision, true, true, false)
     }
-    if (!forceInputRevision && !layerConditions && JSON.stringify(settings) === JSON.stringify(currentSettings)) return false
-    scene.settings = { ...settings }
+    if (!forceInputRevision && !layerConditions && !minimalLiveInputPatch && JSON.stringify(settings) === JSON.stringify(currentSettings)) return false
+    scene.settings = minimalLiveInputPatch ? { ...currentSettings, ...settings } : { ...settings }
     if (layerConditions) scene.layer_conditions = layerConditions
     scene.id = undefined
     _webRtcLastScene = JSON.stringify(scene)
@@ -1149,6 +1253,14 @@ export function stopWebRtc() {
   if (_stoppingWebRtc) return
   _stoppingWebRtc = true
   _webRtcLifecycleSeq++
+  for (const state of Object.values(_realtimeEventStates)) {
+    if (state.timer !== undefined) {
+      window.clearTimeout(state.timer)
+      state.timer = undefined
+    }
+    state.pending = undefined
+    state.lastAt = 0
+  }
   if (_frameLoopRaf) { window.cancelAnimationFrame(_frameLoopRaf); _frameLoopRaf = undefined }
   if (_webRtcMediaPeer) { _webRtcMediaPeer.close(); _webRtcMediaPeer = undefined }
   _webRtcMediaPeerSessionId = ''
@@ -1175,6 +1287,8 @@ export function stopWebRtc() {
   _webRtcSceneRequestVersion = 0
   _webRtcResourceRequestVersion = 0
   _webRtcResourceSentVersion = 0
+  _webRtcForceInputRevision = false
+  _webRtcPendingLiveInputUpdate = false
   _webRtcSceneScheduled = false
   _webRtcInputReady = false
   _clearWebRtcSeedRotationTimer()
@@ -1213,6 +1327,8 @@ const _sceneResourceDebugData = new Map<string, { resourceId: string; debugName:
 const _debugSurfaces = new Map<string, DebugSurface>()
 const _debugCanvasMedia = new Map<string, { canvas: HTMLCanvasElement; stream: MediaStream; track?: MediaStreamTrack }>()
 const _sceneResourceDebugMedia = new Map<string, { canvas?: HTMLCanvasElement; video?: HTMLVideoElement; url?: string }>()
+const _backendDebugChannelNames = new Set<string>()
+const _backendDebugImageUrls = new Map<string, string>()
 let _sceneResourceDebugSeq = 0
 
 export function getDebugChannelData() { return _debugChannelData }
@@ -1221,7 +1337,12 @@ export function getSceneResourceDebugData() {
 }
 export function getDebugSurfaces() { return new Map(_debugSurfaces) }
 
+function _shouldRegisterDebugSurface() {
+  return $stream.get().debugStreamsEnabled || $stream.get().isStreaming
+}
+
 export function registerDebugCanvasSurface(id: string, name: string, canvas: HTMLCanvasElement) {
+  if (!_shouldRegisterDebugSurface()) return
   const existing = _debugSurfaces.get(id)
   if (existing?.kind === 'canvas' && existing.canvas === canvas && existing.name === name) return
   _debugSurfaces.set(id, { id, name, kind: 'canvas', canvas })
@@ -1230,6 +1351,7 @@ export function registerDebugCanvasSurface(id: string, name: string, canvas: HTM
 }
 
 export function registerDebugStreamSurface(id: string, name: string, stream: MediaStream) {
+  if (!_shouldRegisterDebugSurface()) return
   const existing = _debugSurfaces.get(id)
   if (existing?.kind === 'stream' && existing.stream === stream && existing.name === name) return
   _debugSurfaces.set(id, { id, name, kind: 'stream', stream })
@@ -1237,6 +1359,7 @@ export function registerDebugStreamSurface(id: string, name: string, stream: Med
 }
 
 function _registerMediaTrackDebugChannel(streamId: string, label: string) {
+  if (!$stream.get().debugStreamsEnabled) return
   const channelName = `input/resource/${streamId} (${_resourceName(label)})`
   _debugChannelData.set(channelName, `stream:${streamId}`)
   const current = $stream.get().debugChannelNames.filter((name) => name !== channelName)
@@ -1250,6 +1373,28 @@ export function unregisterDebugSurface(id: string) {
     _debugCanvasMedia.delete(id)
   }
   if (_debugSurfaces.delete(id)) window.dispatchEvent(new CustomEvent('rtd:debug-surfaces-update'))
+}
+
+function _registerBackendDebugImageSurface(channelName: string, dataUrl: string) {
+  if (_backendDebugImageUrls.get(channelName) === dataUrl && _debugSurfaces.has(channelName)) return
+  _backendDebugImageUrls.set(channelName, dataUrl)
+  const image = new Image()
+  image.onload = () => {
+    if (_backendDebugImageUrls.get(channelName) !== dataUrl) return
+    const canvas = document.createElement('canvas')
+    canvas.width = Math.max(1, image.naturalWidth || image.width)
+    canvas.height = Math.max(1, image.naturalHeight || image.height)
+    const context = canvas.getContext('2d', { alpha: true })
+    context?.clearRect(0, 0, canvas.width, canvas.height)
+    context?.drawImage(image, 0, 0, canvas.width, canvas.height)
+    registerDebugCanvasSurface(channelName, channelName, canvas)
+  }
+  image.onerror = () => {
+    if (_backendDebugImageUrls.get(channelName) !== dataUrl) return
+    _backendDebugImageUrls.delete(channelName)
+    unregisterDebugSurface(channelName)
+  }
+  image.src = dataUrl
 }
 
 export function getDebugSurfaceStream(id: string) {
@@ -1276,6 +1421,10 @@ function _registerDebugCanvasMedia(id: string, canvas: HTMLCanvasElement) {
 }
 
 async function _replaceSceneResourceDebugData(resources: Map<string, SceneResource>, scene?: Record<string, unknown>) {
+  if (!_shouldMaintainSignalSurfaces()) {
+    if (_sceneResourceDebugData.size || _sceneResourceDebugMedia.size) _clearSceneResourceDebugData()
+    return
+  }
   const seq = ++_sceneResourceDebugSeq
   const imageVideoEntries = new Map<string, SceneResource>()
   for (const resource of resources.values()) {
@@ -1345,57 +1494,64 @@ function _legacyResourceDebugChannelName(resource: SceneResource) {
   return `input/resource/${resource.id} (${resource.debugName})`
 }
 
+function _uniqueSceneSignalChannelName(preferred: string, seen: Set<string>) {
+  let candidate = preferred || 'signal'
+  if (!seen.has(candidate)) {
+    seen.add(candidate)
+    return candidate
+  }
+  let index = 2
+  while (seen.has(`${candidate}_${index}`)) index += 1
+  candidate = `${candidate}_${index}`
+  seen.add(candidate)
+  return candidate
+}
+
+function _sceneSignalChannelName(
+  signal: Record<string, unknown>,
+  resource: SceneResource,
+  promptMaskCounts: Map<string, number>,
+  seen: Set<string>,
+) {
+  const layerId = String(signal.layer_id || '').trim()
+  const channel = String(signal.channel || '').trim()
+  const type = String(signal.type || '').trim()
+  let label = ''
+  if (layerId) {
+    if (type === 'rgba' && channel === 'color') label = `${layerId}/RGBA`
+    else if (type === 'rgba_mask' && channel === 'color') label = `${layerId}/RGBAMask`
+    else if (type === 'prompt_mask' && channel === 'prompt') {
+      const count = (promptMaskCounts.get(layerId) ?? 0) + 1
+      promptMaskCounts.set(layerId, count)
+      label = `${layerId}/Prompt${count}`
+    } else if (type === 'cfg_mask' && channel === 'cfg') label = `${layerId}/CFG`
+    else if (type === 'denoise_mask' && channel === 'denoise') label = `${layerId}/Denoise`
+    else if (type === 'controlnet_image') label = `${layerId}/ControlNet`
+    else if (resource.debugName) label = resource.debugName
+  } else if (resource.debugName && !resource.debugName.startsWith('input.')) {
+    label = resource.debugName
+  }
+  return _uniqueSceneSignalChannelName(label || resource.debugName || String(signal.id || 'signal'), seen)
+}
+
 function _sceneSignalDebugEntries(scene: Record<string, unknown> | undefined, resources: Map<string, SceneResource>) {
   const out = new Map<string, { resource: SceneResource; channelName: string }>()
   const signals = Array.isArray(scene?.signals) ? scene.signals as Record<string, unknown>[] : []
-  const promptIndexByLayer = new Map<string, number>()
-  const layerNameByRaw = new Map<string, string>()
-  for (const signal of signals) {
+  const promptMaskCounts = new Map<string, number>()
+  const channelNames = new Set<string>()
+  for (const [index, signal] of signals.entries()) {
+    const signalId = String(signal.id || '').trim()
+    if (!signalId || out.has(signalId)) continue
     const resourceId = String(signal.resource_ref || '')
     const resource = resources.get(resourceId)
     if (!resource) continue
-    const label = _signalDebugChannelName(signal, promptIndexByLayer, layerNameByRaw)
-    if (!label) continue
-    out.set(String(signal.id || label), { resource, channelName: label })
+    if (resource.debugName.startsWith('input.')) continue
+    const fallbackType = String(signal.type || signal.channel || 'signal').trim() || 'signal'
+    const channelName = _sceneSignalChannelName(signal, resource, promptMaskCounts, channelNames)
+      || _uniqueSceneSignalChannelName(`${fallbackType}.${index + 1}`, channelNames)
+    out.set(signalId || `${fallbackType}.${index + 1}`, { resource, channelName })
   }
   return out
-}
-
-function _signalDebugChannelName(signal: Record<string, unknown>, promptIndexByLayer: Map<string, number>, layerNameByRaw: Map<string, string>) {
-  const role = String(signal.role || '')
-  if (role === 'input' || role === 'input_mask') return ''
-  const rawLayer = _resourceName(String(signal.layer_id || 'layer'))
-  const layer = _signalLayerLabel(rawLayer, layerNameByRaw)
-  const region = _resourceName(String(signal.region_id || ''))
-  const type = String(signal.type || '')
-  const channel = String(signal.channel || '')
-  if (type === 'rgba' && channel === 'color') return `${layer}/RGBA`
-  if (type === 'rgba' && channel === 'color_image') return `${layer}/RGBAImage`
-  if (type === 'rgba_mask' || (type === 'prompt_mask' && region.startsWith('inherited'))) return `${layer}/RGBAPrompt`
-  if (type === 'cfg_mask' || channel === 'cfg') return `${layer}/CFG`
-  if (type === 'denoise_mask' || channel === 'denoise') return `${layer}/Denoise`
-  if (type === 'prompt_mask' || channel === 'prompt') {
-    const nextIndex = (promptIndexByLayer.get(layer) || 0) + 1
-    promptIndexByLayer.set(layer, nextIndex)
-    return `${layer}/Prompt${nextIndex}`
-  }
-  if (type === 'controlnet_image') return `${layer}/ControlNet`
-  return ''
-}
-
-function _signalLayerLabel(rawLayer: string, layerNameByRaw: Map<string, string>) {
-  if (layerNameByRaw.has(rawLayer)) return String(layerNameByRaw.get(rawLayer))
-  const normalized = rawLayer.toLowerCase()
-  const isUuidLike = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(rawLayer)
-  const isHashLike = /^[0-9a-f]{12,}$/i.test(rawLayer)
-  const isGeneratedLayerName = /^layer[_-]?\d+$/i.test(rawLayer)
-  if (isUuidLike || isHashLike || isGeneratedLayerName || normalized === 'layer') {
-    const fallback = `layer${layerNameByRaw.size + 1}`
-    layerNameByRaw.set(rawLayer, fallback)
-    return fallback
-  }
-  layerNameByRaw.set(rawLayer, rawLayer)
-  return rawLayer
 }
 
 async function _registerSceneResourceDebugStream(resource: SceneResource) {
@@ -1522,12 +1678,71 @@ function _clearSceneResourceDebugData() {
 }
 
 function _applyDebugChannels(incoming: Record<string, string>) {
+  const isSignalChannel = (name: string) => name === 'output' || name.startsWith('final/')
+  if (!$stream.get().debugStreamsEnabled) {
+    // Even without debug mode, always process signal channels (output + final/)
+    // so the signal picker can show thumbnails during normal streaming.
+    const signalEntries = Object.entries(incoming).filter(([name]) => isSignalChannel(name))
+    // Clean up stale non-signal backend channels
+    for (const name of _backendDebugChannelNames) {
+      if (!isSignalChannel(name)) {
+        _debugChannelData.delete(name)
+        _backendDebugImageUrls.delete(name)
+        unregisterDebugSurface(name)
+        _backendDebugChannelNames.delete(name)
+      }
+    }
+    if (signalEntries.length === 0) return
+    // Clean up stale signal channels no longer in incoming
+    const incomingSignalNames = new Set(signalEntries.map(([n]) => n))
+    for (const name of _backendDebugChannelNames) {
+      if (isSignalChannel(name) && !incomingSignalNames.has(name)) {
+        _debugChannelData.delete(name)
+        _backendDebugImageUrls.delete(name)
+        unregisterDebugSurface(name)
+        _backendDebugChannelNames.delete(name)
+      }
+    }
+    for (const [name, val] of signalEntries) {
+      _backendDebugChannelNames.add(name)
+      if (val.startsWith('data:image/')) {
+        _registerBackendDebugImageSurface(name, val)
+        _debugChannelData.set(name, `stream:${name}`)
+      } else {
+        _backendDebugImageUrls.delete(name)
+        unregisterDebugSurface(name)
+        _debugChannelData.set(name, val)
+      }
+    }
+    window.dispatchEvent(new CustomEvent('rtd:debug-update', { detail: Object.fromEntries(signalEntries) }))
+    return
+  }
+  const incomingNames = new Set(Object.keys(incoming))
+  for (const previousName of _backendDebugChannelNames) {
+    if (!incomingNames.has(previousName)) {
+      _debugChannelData.delete(previousName)
+      _backendDebugImageUrls.delete(previousName)
+      unregisterDebugSurface(previousName)
+      _backendDebugChannelNames.delete(previousName)
+    }
+  }
   const names = Object.keys(incoming)
   for (const [name, val] of Object.entries(incoming)) {
-    _debugChannelData.set(name, val.startsWith('data:image/') ? `stream:${name}` : val)
+    _backendDebugChannelNames.add(name)
+    if (val.startsWith('data:image/')) {
+      _registerBackendDebugImageSurface(name, val)
+      _debugChannelData.set(name, `stream:${name}`)
+    } else {
+      _backendDebugImageUrls.delete(name)
+      unregisterDebugSurface(name)
+      _debugChannelData.set(name, val)
+    }
   }
   const current = $stream.get().debugChannelNames
-  const structureChanged = names.some((n) => !current.includes(n))
-  if (structureChanged) $stream.setKey('debugChannelNames', [...new Set([...current, ...names])])
+  const structureChanged = names.some((n) => !current.includes(n)) || current.some((name) => _backendDebugChannelNames.has(name) && !incomingNames.has(name))
+  if (structureChanged) {
+    const preserved = current.filter((name) => !_backendDebugChannelNames.has(name) || incomingNames.has(name))
+    $stream.setKey('debugChannelNames', [...new Set([...preserved, ...names])])
+  }
   window.dispatchEvent(new CustomEvent('rtd:debug-update', { detail: incoming }))
 }

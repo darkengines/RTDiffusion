@@ -57,6 +57,7 @@ import { getDebugSurfaceStream, getDebugSurfaces, getSceneResourceDebugData, get
 const CFG_MASK_F32_MIME = 'application/x-rtd-mask-f32'
 const CFG_MASK_F32_MAGIC = 'RTF1'
 const CFG_MASK_MAX = 30
+const CFG_FACTOR_DEFAULT = 1.0
 
 type SvgTransformHandle = 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w'
 type SvgTransformMode = 'move' | 'rotate' | SvgTransformHandle
@@ -257,7 +258,7 @@ export class RtdCanvasEditor extends LitElement {
   private inputCanvasMediaSource?: HTMLCanvasElement
   private inputCanvasCaptureCanvas?: HTMLCanvasElement
   private inputCanvasCaptureRaf?: number
-  private readonly inputCanvasCaptureFps = 30
+  private readonly inputCanvasCaptureFps = 0
   private inputCanvasMediaCaptureFps = 0
   private inputCanvasMediaRegistered = false
   private streamOutputBackingCanvas?: HTMLCanvasElement
@@ -1230,14 +1231,12 @@ export class RtdCanvasEditor extends LitElement {
     const names = new Set<string>(['output'])
     void this.resourceDebugVersion
     for (const surface of getDebugSurfaces().values()) {
-      if (!surface.id || surface.id.startsWith('input/resource/')) continue
-      names.add(surface.id)
-      names.add(surface.name)
+      if (!surface.id) continue
+      if (surface.id.startsWith('final/')) names.add(surface.id)
     }
     for (const name of getSceneResourceDebugData().keys()) {
       if (!name || names.has(name)) continue
-      if (name.startsWith('input/resource/')) continue
-      names.add(name)
+      if (name.startsWith('final/')) names.add(name)
     }
     return [...names].sort((a, b) => {
       if (a === 'output') return -1
@@ -1503,7 +1502,10 @@ export class RtdCanvasEditor extends LitElement {
 
   private ensureInputCanvasMediaTrack() {
     const capture = this.ensureInputCanvasCaptureCanvas()
-    if (!$stream.get().isStreaming || typeof capture.captureStream !== 'function') return
+    if (!$stream.get().isStreaming || typeof capture.captureStream !== 'function') {
+      this.stopInputCanvasMediaTrack()
+      return
+    }
     if (this.inputCanvasMediaStream && this.inputCanvasMediaSource !== capture) {
       this.stopInputCanvasMediaTrack()
     }
@@ -1578,7 +1580,7 @@ export class RtdCanvasEditor extends LitElement {
       const shouldRefreshLayerConditions = this.liveStreamLayerConditionRefreshScheduled
       this.liveStreamResourceRefreshScheduled = false
       this.liveStreamLayerConditionRefreshScheduled = false
-      this.dispatchEvent(new CustomEvent('rtd-send-frame', { bubbles: true, composed: true, detail: { refreshResources: shouldRefreshResources, refreshLayerConditions: shouldRefreshLayerConditions } }))
+      this.dispatchEvent(new CustomEvent('rtd-send-frame', { bubbles: true, composed: true, detail: { refreshResources: shouldRefreshResources, refreshLayerConditions: shouldRefreshLayerConditions, liveInputChanged: true } }))
       return
     }
     if (this.liveStreamUpdateScheduled) return
@@ -1590,7 +1592,7 @@ export class RtdCanvasEditor extends LitElement {
       const shouldRefreshLayerConditions = this.liveStreamLayerConditionRefreshScheduled
       this.liveStreamResourceRefreshScheduled = false
       this.liveStreamLayerConditionRefreshScheduled = false
-      this.dispatchEvent(new CustomEvent('rtd-send-frame', { bubbles: true, composed: true, detail: { refreshResources: shouldRefreshResources, refreshLayerConditions: shouldRefreshLayerConditions } }))
+      this.dispatchEvent(new CustomEvent('rtd-send-frame', { bubbles: true, composed: true, detail: { refreshResources: shouldRefreshResources, refreshLayerConditions: shouldRefreshLayerConditions, liveInputChanged: true } }))
     })
   }
   private queueLiveStreamFrameIfInputChanged(force = false, refreshResources = false, refreshLayerConditions = false) {
@@ -1605,13 +1607,15 @@ export class RtdCanvasEditor extends LitElement {
       }
       this.refreshInputCanvasCaptureSurface()
       this.scheduleInputCanvasCaptureRefresh(force)
+    } else if (this.inputCanvasMediaTrack) {
+      this.stopInputCanvasMediaTrack()
     }
     this.markLiveInputChanged()
     this.queueLiveStreamFrameIfInputChanged(force, refreshResources, refreshLayerConditions)
   }
 
   private shouldRefreshLiveResourcesOnDraw() {
-    return this.selectedOutputSignal !== 'output'
+    return $stream.get().isStreaming
   }
 
   private layerConditionTopologySignature() {
@@ -1696,8 +1700,8 @@ export class RtdCanvasEditor extends LitElement {
     .output-timing-row span { color: var(--fg-dim, #a5a7b3); }
     .output-timing-row strong { text-align: right; color: #effff8; font-variant-numeric: tabular-nums; }
     .output-timing-meta { display: flex; flex-direction: column; gap: 2px; padding-top: 2px; border-top: 1px solid rgba(255,255,255,0.08); font-size: 10px; color: var(--fg-dim, #8f92a0); }
-    .signal-picker-panel { position: absolute; top: 22px; left: 6px; right: 6px; max-height: min(46%, 360px); z-index: 22; background: rgba(12,12,16,0.95); border: 1px solid var(--border, #3a3a4c); border-radius: 4px; overflow: hidden; box-shadow: 0 10px 28px rgba(0,0,0,0.38); }
-    .signal-picker-grid { overflow: auto; max-height: min(46%, 360px); padding: 6px; display: grid; grid-template-columns: repeat(auto-fill, minmax(136px, 1fr)); gap: 6px; }
+    .signal-picker-panel { position: absolute; top: 22px; left: 6px; right: 6px; max-height: min(46%, 360px); z-index: 22; background: rgba(12,12,16,0.95); border: 1px solid var(--border, #3a3a4c); border-radius: 4px; overflow: hidden; box-shadow: 0 10px 28px rgba(0,0,0,0.38); display: flex; flex-direction: column; }
+    .signal-picker-grid { overflow-y: auto; flex: 1; min-height: 0; padding: 6px; display: grid; grid-template-columns: repeat(auto-fill, minmax(136px, 1fr)); gap: 6px; }
     .signal-picker-tile { display: flex; flex-direction: column; gap: 4px; margin: 0; padding: 4px; background: rgba(8,8,12,0.7); border: 1px solid rgba(255,255,255,0.12); border-radius: 4px; color: var(--fg, #d4d4d8); text-align: left; }
     .signal-picker-tile.active { border-color: #7aadff; box-shadow: 0 0 0 1px rgba(122,173,255,0.4) inset; }
     .signal-picker-thumb { width: 100%; aspect-ratio: 4 / 3; background: repeating-conic-gradient(#2b2d36 0% 25%, #6f7280 0% 50%) 0 0 / 16px 16px; border-radius: 3px; overflow: hidden; }
@@ -2416,8 +2420,8 @@ export class RtdCanvasEditor extends LitElement {
   private defaultLayerRegion(layer: LayerItem): RegionItem {
     const transform = layer.transform
     const scene = $scene.get()
-    const denoise = layer.preset.rgbaDenoiseInherited ? scene.strength : layer.preset.strength
-    const cfg = layer.preset.rgbaCfgInherited ? scene.cfg : (layer.preset.layerCfg ?? layer.preset.cfg)
+    const denoise = layer.preset.strength
+    const cfg = CFG_FACTOR_DEFAULT
     return {
       id: `inherited:${layer.id}`,
       target: 'layer',
@@ -2433,7 +2437,7 @@ export class RtdCanvasEditor extends LitElement {
         inverted: false,
         shape: 'box',
       },
-      maskStrength: layer.preset.rgbaWeightInherited ? 1 : layer.preset.conditionWeight,
+      maskStrength: layer.preset.conditionWeight,
       innerBlur: layer.preset.conditionInnerBlur,
       outerBlur: layer.preset.conditionOuterBlur,
       negate: layer.preset.conditionNegate,
@@ -2451,23 +2455,22 @@ export class RtdCanvasEditor extends LitElement {
       denoiseMaskInherited: false,
       regionCfg: cfg,
       regionSteps: layer.preset.layerSteps,
-      blendingEnabled: layer.preset.rgbaBlendingInherited ? true : layer.preset.rgbaMaskBlendingEnabled,
-      blendingRadius: layer.preset.rgbaBlendingInherited ? 32 : layer.preset.rgbaMaskBlendingRadius,
-      blendingStrength: layer.preset.rgbaBlendingInherited ? 1 : layer.preset.rgbaMaskBlendingStrength,
+      blendingEnabled: true,
+      blendingRadius: 32,
+      blendingStrength: 1,
     }
   }
 
   private resolvedLayerRgbaRegionPatch(layer: LayerItem): Partial<RegionItem> {
-    const scene = $scene.get()
     return {
-      prompt: layer.preset.rgbaPromptInherited ? scene.prompt : layer.preset.prompt,
-      negativePrompt: layer.preset.rgbaNegativePromptInherited ? scene.negativePrompt : layer.preset.negativePrompt,
-      denoise: layer.preset.rgbaDenoiseInherited ? scene.strength : layer.preset.strength,
-      regionCfg: layer.preset.rgbaCfgInherited ? scene.cfg : (layer.preset.layerCfg ?? layer.preset.cfg),
-      maskStrength: layer.preset.rgbaWeightInherited ? 1 : layer.preset.conditionWeight,
-      blendingEnabled: layer.preset.rgbaBlendingInherited ? true : layer.preset.rgbaMaskBlendingEnabled,
-      blendingRadius: layer.preset.rgbaBlendingInherited ? 32 : layer.preset.rgbaMaskBlendingRadius,
-      blendingStrength: layer.preset.rgbaBlendingInherited ? 1 : layer.preset.rgbaMaskBlendingStrength,
+      prompt: layer.preset.prompt,
+      negativePrompt: layer.preset.negativePrompt,
+      denoise: layer.preset.strength,
+      regionCfg: CFG_FACTOR_DEFAULT,
+      maskStrength: layer.preset.conditionWeight,
+      blendingEnabled: true,
+      blendingRadius: 32,
+      blendingStrength: 1,
     }
   }
 
@@ -3566,7 +3569,13 @@ export class RtdCanvasEditor extends LitElement {
   private attachStrokeToLayer(object: FabricObject, layerId = this.pendingPaintLayerId || this.selectedLayerId, erase = this.isEraseStroke()) {
     const withMeta = object as FabricObject & { __uid?: string; __paintChild?: boolean; __parentLayerId?: string }
     const parentLayerId = strokeParentLayerId(layerId, this.selectedLayerId, withMeta.__uid)
-    if (!parentLayerId) {
+    const parentLayer = parentLayerId ? this.findLayer(parentLayerId) as (FabricObject & { __paintChild?: boolean; __parentLayerId?: string }) | undefined : undefined
+    const validParent = !!parentLayer && !isPaintChildObject(parentLayer)
+    if (!parentLayerId || !validParent) {
+      // A stroke with no valid parent layer must never remain on canvas,
+      // otherwise it becomes a global top-level object and can alter
+      // content outside the selected layer.
+      this.fabricCanvas?.remove(object)
       this.pendingPaintLayerId = ''
       this.syncLayers()
       return
@@ -3591,7 +3600,7 @@ export class RtdCanvasEditor extends LitElement {
     } as Partial<FabricObject>)
     this.selectedEntity = 'layer'
     this.selectedLayerId = parentLayerId
-    const parent = this.findLayer(parentLayerId)
+    const parent = parentLayer
     if (parent) this.fabricCanvas?.setActiveObject(parent)
     this.pendingPaintLayerId = ''
     if (erase) {
@@ -4130,6 +4139,7 @@ export class RtdCanvasEditor extends LitElement {
   }
 
   private queueLiveMaskStreamUpdate(force = false, refreshResources = false) {
+    refreshResources ||= this.shouldRefreshLiveResourcesOnDraw()
     if (force) {
       if (this.maskStreamUpdateRaf !== undefined) window.cancelAnimationFrame(this.maskStreamUpdateRaf)
       this.maskStreamUpdateRaf = undefined
@@ -4347,10 +4357,6 @@ export class RtdCanvasEditor extends LitElement {
     }
   }
 
-  private channelMaskRevision(scope: MaskScope, channel: MaskChannel) {
-    return this.channelMaskRevisions.get(this.maskChannelKey(scope, channel)) ?? 0
-  }
-
   private bumpLayerConditionRevision(layerId: string) {
     if (!layerId) return
     this.layerConditionRevisions.set(layerId, (this.layerConditionRevisions.get(layerId) ?? 0) + 1)
@@ -4358,11 +4364,6 @@ export class RtdCanvasEditor extends LitElement {
 
   private layerConditionRevision(layerId: string) {
     return this.layerConditionRevisions.get(layerId) ?? 0
-  }
-
-  private layerMaskRevisionSignature(layerId: string) {
-    const scope: MaskScope = `layer:${layerId}`
-    return ['color', 'prompt', 'cfg', 'denoise'].map((channel) => `${channel}:${this.channelMaskRevision(scope, channel as MaskChannel)}`).join('|')
   }
 
   private layerConditionImageSignature(layer: LayerItem, region: RegionItem) {
@@ -4373,17 +4374,6 @@ export class RtdCanvasEditor extends LitElement {
       stack: this.layerStackIndex(layer.id),
       inherited: region.id.startsWith('inherited:'),
       region: region.id.startsWith('inherited:') ? this.layerRegionCacheShape(region) : region.id,
-    })
-  }
-
-  private layerRegionMaskSignature(layer: LayerItem, region: RegionItem) {
-    return JSON.stringify({
-      stage: [this.stageWidth, this.stageHeight],
-      layer: layer.id,
-      layerRevision: this.layerConditionRevision(layer.id),
-      masks: this.layerMaskRevisionSignature(layer.id),
-      rgbaBlending: [layer.preset.rgbaMaskBlendingEnabled, layer.preset.rgbaMaskBlendingRadius, layer.preset.rgbaMaskBlendingStrength],
-      region: this.layerRegionCacheShape(region),
     })
   }
 
@@ -5758,54 +5748,48 @@ export class RtdCanvasEditor extends LitElement {
       if (!object) continue
       const timing = schedules.get(layer.id) ?? { start: 0, end: 1, schedule: 'linear' as RegionSchedule, active: true }
       if (!timing.active) continue
-      const layerDenoiseMask = this.exportLayerParameterMask(layer.id, 'denoise')
       for (const region of this.layerRegionSpecs(layer)) {
+        const isDefaultRgbaRegion = region.id.startsWith('inherited:')
         const prompt = region.inherited ? layer.preset.prompt : region.prompt
         const negativePrompt = region.inherited ? layer.preset.negativePrompt : region.negativePrompt
         const regionTiming = this.resolvedRegionTiming(region, timing)
         const channelRefs = channelRefsByRegion.get(this.regionRefKey(layer.id, region.id)) ?? {}
-          const cfgMaskInherited = region.cfgMaskInherited ?? true
-          const denoiseMaskInherited = region.denoiseMaskInherited ?? true
-          const regionMask = (!cfgMaskInherited || !denoiseMaskInherited) ? this.layerRegionConditionMaskCanvas(layer.id, region) : undefined
-          const cfgValue = cfgMaskInherited ? (layer.preset.layerCfg ?? layer.preset.cfg) : (region.regionCfg ?? layer.preset.layerCfg ?? layer.preset.cfg)
-          const cfgMask = cfgMaskInherited
-            ? this.exportLayerParameterMask(layer.id, 'cfg', cfgValue)
-            : this.exportCfgMaskDataUrl(regionMask!, cfgValue)
-          const regionMaskDataUrl = (!channelRefs.prompt || !denoiseMaskInherited)
-            ? this.exportLayerRegionMaskDataUrl(layer, region, regionMask)
-            : undefined
-          const denoiseMask = denoiseMaskInherited ? layerDenoiseMask : regionMaskDataUrl
+        const cfgValue = region.regionCfg ?? CFG_FACTOR_DEFAULT
+        const hasExplicitPrompt = Boolean(channelRefs.prompt || this.layerRegionParameterMaskCanvas(layer.id, region, 'prompt'))
+        const explicitCfgMask = this.layerRegionParameterMaskCanvas(layer.id, region, 'cfg')
+        const explicitDenoiseMask = this.layerRegionParameterMaskCanvas(layer.id, region, 'denoise')
+        const cfgMask = explicitCfgMask ? this.exportCfgMaskDataUrl(explicitCfgMask, cfgValue) : undefined
+        const denoiseMask = explicitDenoiseMask ? this.exportMaskCanvas(explicitDenoiseMask) : undefined
+        const hasExplicitCfg = Boolean(channelRefs.cfg || cfgMask)
+        const hasExplicitDenoise = Boolean(channelRefs.denoise || denoiseMask)
         conditions.push({
           layer_id: layer.id,
           z_index: this.layerStackIndex(layer.id),
           region_id: region.id,
           name: this.promptMaskName(layer, region),
           mask_color: region.color,
-          prompt: layer.preset.autoTag ? '' : prompt,
-          negative_prompt: negativePrompt,
+          prompt: (isDefaultRgbaRegion && !hasExplicitPrompt) || layer.preset.autoTag ? '' : prompt,
+          negative_prompt: isDefaultRgbaRegion && !hasExplicitPrompt ? '' : negativePrompt,
           auto_tag: layer.preset.autoTag,
           auto_tag_threshold: layer.preset.autoTagThreshold,
           auto_tag_refresh_frames: layer.preset.autoTagRefreshFrames,
           image: this.exportLayerRegionConditionImage(object, layer, region, exportPass),
-          prompt_mask: channelRefs.prompt ? undefined : regionMaskDataUrl,
+          prompt_mask: undefined,
           cfg_mask: channelRefs.cfg ? undefined : cfgMask,
           denoise_mask: channelRefs.denoise ? undefined : denoiseMask,
           weight: region.inherited ? layer.preset.conditionWeight : region.maskStrength,
           mode: region.inherited ? layer.preset.conditionMode : (region.mode ?? layer.preset.conditionMode),
           mask_operator: 'max',
-          denoise_operator: 'max',
-          cfg_operator: 'max',
-          denoise: denoiseMaskInherited ? layer.preset.strength : region.denoise,
-          cfg: cfgMaskInherited ? (layer.preset.layerCfg ?? layer.preset.cfg) : (region.regionCfg ?? layer.preset.layerCfg ?? layer.preset.cfg),
+          denoise_operator: 'replace',
+          cfg_operator: 'replace',
+          denoise: hasExplicitDenoise ? (region.denoise ?? layer.preset.strength) : undefined,
+          cfg: hasExplicitCfg ? cfgValue : undefined,
           steps: undefined,
           sampler: undefined,
           scheduler: undefined,
           schedule: regionTiming.schedule,
           schedule_start: regionTiming.start,
           schedule_end: regionTiming.end,
-          blending_enabled: region.blendingEnabled ?? true,
-          blending_radius: region.blendingRadius ?? 32,
-          blending_strength: region.blendingStrength ?? 1,
           primary_input: this._isVideoLayer(layer.id),
           ...channelRefs,
         })
@@ -5822,38 +5806,38 @@ export class RtdCanvasEditor extends LitElement {
       const timing = schedules.get(layer.id) ?? { start: 0, end: 1, schedule: 'linear' as RegionSchedule, active: true }
       if (!timing.active) continue
       for (const region of this.layerRegionSpecs(layer)) {
+        const isDefaultRgbaRegion = region.id.startsWith('inherited:')
         const regionTiming = this.resolvedRegionTiming(region, timing)
-        const cfgMaskInherited = region.cfgMaskInherited ?? true
-        const denoiseMaskInherited = region.denoiseMaskInherited ?? true
         const prompt = region.inherited ? layer.preset.prompt : region.prompt
         const negativePrompt = region.inherited ? layer.preset.negativePrompt : region.negativePrompt
+        const cfgValue = region.regionCfg ?? CFG_FACTOR_DEFAULT
+        const hasExplicitPrompt = Boolean(this.layerRegionParameterMaskCanvas(layer.id, region, 'prompt'))
+        const hasExplicitCfg = Boolean(this.layerRegionParameterMaskCanvas(layer.id, region, 'cfg'))
+        const hasExplicitDenoise = Boolean(this.layerRegionParameterMaskCanvas(layer.id, region, 'denoise'))
         conditions.push({
           layer_id: layer.id,
           z_index: this.layerStackIndex(layer.id),
           region_id: region.id,
           name: this.promptMaskName(layer, region),
           mask_color: region.color,
-          prompt: layer.preset.autoTag ? '' : prompt,
-          negative_prompt: negativePrompt,
+          prompt: (isDefaultRgbaRegion && !hasExplicitPrompt) || layer.preset.autoTag ? '' : prompt,
+          negative_prompt: isDefaultRgbaRegion && !hasExplicitPrompt ? '' : negativePrompt,
           auto_tag: layer.preset.autoTag,
           auto_tag_threshold: layer.preset.autoTagThreshold,
           auto_tag_refresh_frames: layer.preset.autoTagRefreshFrames,
           weight: region.inherited ? layer.preset.conditionWeight : region.maskStrength,
           mode: region.inherited ? layer.preset.conditionMode : (region.mode ?? layer.preset.conditionMode),
           mask_operator: 'max',
-          denoise_operator: 'max',
-          cfg_operator: 'max',
-          denoise: denoiseMaskInherited ? layer.preset.strength : region.denoise,
-          cfg: cfgMaskInherited ? (layer.preset.layerCfg ?? layer.preset.cfg) : (region.regionCfg ?? layer.preset.layerCfg ?? layer.preset.cfg),
+          denoise_operator: 'replace',
+          cfg_operator: 'replace',
+          denoise: hasExplicitDenoise ? (region.denoise ?? layer.preset.strength) : undefined,
+          cfg: hasExplicitCfg ? cfgValue : undefined,
           steps: undefined,
           sampler: undefined,
           scheduler: undefined,
           schedule: regionTiming.schedule,
           schedule_start: regionTiming.start,
           schedule_end: regionTiming.end,
-          blending_enabled: region.blendingEnabled ?? true,
-          blending_radius: region.blendingRadius ?? 32,
-          blending_strength: region.blendingStrength ?? 1,
           primary_input: this._isVideoLayer(layer.id),
         })
       }
@@ -5873,54 +5857,48 @@ export class RtdCanvasEditor extends LitElement {
       if (!object) continue
       const timing = schedules.get(layer.id) ?? { start: 0, end: 1, schedule: 'linear' as RegionSchedule, active: true }
       if (!timing.active) continue
-      const layerDenoiseMask = await this.exportLayerParameterMaskBlob(layer.id, 'denoise')
       for (const region of this.layerRegionSpecs(layer)) {
+        const isDefaultRgbaRegion = region.id.startsWith('inherited:')
         const prompt = region.inherited ? layer.preset.prompt : region.prompt
         const negativePrompt = region.inherited ? layer.preset.negativePrompt : region.negativePrompt
         const regionTiming = this.resolvedRegionTiming(region, timing)
-        const cfgMaskInherited = region.cfgMaskInherited ?? true
-        const denoiseMaskInherited = region.denoiseMaskInherited ?? true
-        const regionMask = (!cfgMaskInherited || !denoiseMaskInherited) ? this.layerRegionConditionMaskCanvas(layer.id, region) : undefined
-        const cfgValue = cfgMaskInherited ? (layer.preset.layerCfg ?? layer.preset.cfg) : (region.regionCfg ?? layer.preset.layerCfg ?? layer.preset.cfg)
+        const cfgValue = region.regionCfg ?? CFG_FACTOR_DEFAULT
         const colorMask = await this.regionChannelMaskBlob(layer.id, region, 'color')
         const promptMask = await this.regionChannelMaskBlob(layer.id, region, 'prompt')
         const cfgMask = await this.regionChannelMaskBlob(layer.id, region, 'cfg')
-          ?? (cfgMaskInherited ? undefined : this.cfgMaskFloatBlob(regionMask!, cfgValue))
-        const regionMaskBlob = await this.exportLayerRegionMaskBlob(layer, region, regionMask)
         const denoiseMask = await this.regionChannelMaskBlob(layer.id, region, 'denoise')
-          ?? (denoiseMaskInherited ? layerDenoiseMask : regionMaskBlob)
+        const hasExplicitPrompt = Boolean(promptMask)
+        const hasExplicitCfg = Boolean(cfgMask)
+        const hasExplicitDenoise = Boolean(denoiseMask)
         conditions.push({
           layer_id: layer.id,
           z_index: this.layerStackIndex(layer.id),
           region_id: region.id,
           name: this.promptMaskName(layer, region),
           mask_color: region.color,
-          prompt: layer.preset.autoTag ? '' : prompt,
-          negative_prompt: negativePrompt,
+          prompt: (isDefaultRgbaRegion && !hasExplicitPrompt) || layer.preset.autoTag ? '' : prompt,
+          negative_prompt: isDefaultRgbaRegion && !hasExplicitPrompt ? '' : negativePrompt,
           auto_tag: layer.preset.autoTag,
           auto_tag_threshold: layer.preset.autoTagThreshold,
           auto_tag_refresh_frames: layer.preset.autoTagRefreshFrames,
           image: await this.exportLayerRegionConditionImageBlob(object, layer, region, exportPass),
-          color_mask: colorMask ?? regionMaskBlob,
-          prompt_mask: promptMask ?? regionMaskBlob,
+          color_mask: colorMask,
+          prompt_mask: isDefaultRgbaRegion ? null : promptMask,
           cfg_mask: cfgMask,
           denoise_mask: denoiseMask,
           weight: region.inherited ? layer.preset.conditionWeight : region.maskStrength,
           mode: region.inherited ? layer.preset.conditionMode : (region.mode ?? layer.preset.conditionMode),
           mask_operator: 'max',
-          denoise_operator: 'max',
-          cfg_operator: 'max',
-          denoise: denoiseMaskInherited ? layer.preset.strength : region.denoise,
-          cfg: cfgMaskInherited ? (layer.preset.layerCfg ?? layer.preset.cfg) : (region.regionCfg ?? layer.preset.layerCfg ?? layer.preset.cfg),
+          denoise_operator: 'replace',
+          cfg_operator: 'replace',
+          denoise: hasExplicitDenoise ? (region.denoise ?? layer.preset.strength) : undefined,
+          cfg: hasExplicitCfg ? cfgValue : undefined,
           steps: undefined,
           sampler: undefined,
           scheduler: undefined,
           schedule: regionTiming.schedule,
           schedule_start: regionTiming.start,
           schedule_end: regionTiming.end,
-          blending_enabled: region.blendingEnabled ?? true,
-          blending_radius: region.blendingRadius ?? 32,
-          blending_strength: region.blendingStrength ?? 1,
           primary_input: this._isVideoLayer(layer.id),
         })
       }
@@ -6074,26 +6052,6 @@ export class RtdCanvasEditor extends LitElement {
     return value
   }
 
-  private exportLayerRegionMaskDataUrl(layer: LayerItem, region: RegionItem, mask?: HTMLCanvasElement) {
-    const cacheKey = `${layer.id}:${region.id}:mask`
-    const signature = this.layerRegionMaskSignature(layer, region)
-    const cached = this.layerRegionMaskDataUrlCache.get(cacheKey)
-    if (cached && cached.signature === signature) return cached.value
-    const value = this.exportMaskCanvas(mask ?? this.layerRegionConditionMaskCanvas(layer.id, region))
-    this.layerRegionMaskDataUrlCache.set(cacheKey, { signature, value })
-    return value
-  }
-
-  private async exportLayerRegionMaskBlob(layer: LayerItem, region: RegionItem, mask?: HTMLCanvasElement) {
-    const cacheKey = `${layer.id}:${region.id}:mask`
-    const signature = this.layerRegionMaskSignature(layer, region)
-    const cached = this.layerRegionMaskBlobCache.get(cacheKey)
-    if (cached && cached.signature === signature) return cached.value
-    const value = await this.canvasToPngBlob(this.renderMaskDataCanvas(mask ?? this.layerRegionConditionMaskCanvas(layer.id, region)))
-    this.layerRegionMaskBlobCache.set(cacheKey, { signature, value })
-    return value
-  }
-
   private renderMaskDataCanvas(mask: HTMLCanvasElement) {
     const canvas = document.createElement('canvas')
     canvas.width = mask.width
@@ -6112,44 +6070,6 @@ export class RtdCanvasEditor extends LitElement {
 
   private exportMaskCanvas(mask: HTMLCanvasElement) {
     return this.renderMaskDataCanvas(mask).toDataURL('image/png')
-  }
-
-  private exportOptionalLumaMask(mask: HTMLCanvasElement | null) {
-    if (!mask) return undefined
-    return this.canvasHasNonZeroLuma(mask) ? mask.toDataURL('image/png') : undefined
-  }
-
-  private exportLayerParameterMask(layerId: string, channel: Extract<MaskChannel, 'cfg' | 'denoise'>, cfgValue = CFG_MASK_MAX) {
-    const scope: MaskScope = `layer:${layerId}`
-    const revision = this.channelMaskRevision(scope, channel)
-    const cacheKey = `${this.maskChannelKey(scope, channel)}::${this.stageWidth}x${this.stageHeight}::${channel === 'cfg' ? cfgValue : ''}`
-    const cached = this.parameterMaskDataUrlCache.get(cacheKey)
-    if (cached && cached.revision === revision) return cached.value
-    const mask = this.layerParameterMaskCanvas(layerId, channel)
-    const value = channel === 'cfg' ? this.exportOptionalCfgMask(mask, cfgValue) : this.exportOptionalLumaMask(mask)
-    this.parameterMaskDataUrlCache.set(cacheKey, { revision, value })
-    return value
-  }
-
-  private async exportLayerParameterMaskBlob(layerId: string, channel: Extract<MaskChannel, 'cfg' | 'denoise'>, cfgValue = CFG_MASK_MAX) {
-    const scope: MaskScope = `layer:${layerId}`
-    const revision = this.channelMaskRevision(scope, channel)
-    const cacheKey = `${this.maskChannelKey(scope, channel)}::${this.stageWidth}x${this.stageHeight}::${channel === 'cfg' ? cfgValue : ''}`
-    const cached = this.parameterMaskBlobCache.get(cacheKey)
-    if (cached && cached.revision === revision) return cached.value
-    const mask = this.layerParameterMaskCanvas(layerId, channel)
-    const value = !mask || !this.canvasHasNonZeroLuma(mask)
-      ? undefined
-      : channel === 'cfg'
-        ? this.cfgMaskFloatBlob(mask, cfgValue)
-        : await this.canvasToPngBlob(mask)
-    this.parameterMaskBlobCache.set(cacheKey, { revision, value })
-    return value
-  }
-
-  private exportOptionalCfgMask(mask: HTMLCanvasElement | null, cfgValue: number) {
-    if (!mask) return undefined
-    return this.canvasHasNonZeroLuma(mask) ? this.exportCfgMaskDataUrl(mask, cfgValue) : undefined
   }
 
   private exportCfgMaskDataUrl(mask: HTMLCanvasElement, cfgValue: number) {
@@ -6176,7 +6096,7 @@ export class RtdCanvasEditor extends LitElement {
     view.setUint32(4, width, true)
     view.setUint32(8, height, true)
     const data = mask.getContext('2d')!.getImageData(0, 0, width, height).data
-    const cfg = this.clamp(Number.isFinite(cfgValue) ? cfgValue : CFG_MASK_MAX, 0, CFG_MASK_MAX, CFG_MASK_MAX)
+    const cfg = this.clamp(Number.isFinite(cfgValue) ? cfgValue : CFG_FACTOR_DEFAULT, 0, CFG_MASK_MAX, CFG_FACTOR_DEFAULT)
     let offset = 12
     for (let index = 0; index < data.length; index += 4) {
       view.setFloat32(offset, (this.maskValueFromPixel(data, index) / 255) * cfg, true)
@@ -6191,6 +6111,14 @@ export class RtdCanvasEditor extends LitElement {
     canvas.height = this.stageHeight
     const context = canvas.getContext('2d')!
     const mask = this.renderLayerAlphaMaskCanvas(renderedLayer, region.negate, 1)
+    if (!this.canvasHasNonZeroAlpha(mask)) {
+      // Keep alpha fully transparent (no spatial influence) while storing
+      // neutral RGB in transparent pixels so naive RGBA->RGB decodes do not
+      // collapse to black source content.
+      context.fillStyle = 'rgba(128,128,128,0)'
+      context.fillRect(0, 0, canvas.width, canvas.height)
+      return canvas
+    }
     // Apply outer blur then inner blur independently.
     // Outer blur: draw blurred version first (extends alpha outward as a halo),
     //   then draw the solid original on top to keep the sprite interior fully opaque.
@@ -6229,6 +6157,15 @@ export class RtdCanvasEditor extends LitElement {
     return canvas
   }
 
+  private canvasHasNonZeroAlpha(canvas: HTMLCanvasElement) {
+    const data = canvas.getContext('2d')?.getImageData(0, 0, canvas.width, canvas.height).data
+    if (!data) return false
+    for (let index = 3; index < data.length; index += 4) {
+      if (data[index] > 0) return true
+    }
+    return false
+  }
+
   private exportInheritedLayerConditionImage(renderedLayer: HTMLCanvasElement, region: RegionItem) {
     const canvas = this.renderInheritedLayerConditionCanvas(renderedLayer, region)
     return canvas.toDataURL('image/png')
@@ -6263,7 +6200,7 @@ export class RtdCanvasEditor extends LitElement {
   private layerRegionConditionMaskCanvas(layerId: string, region: RegionItem) {
     if (region.id.startsWith('inherited:')) return this.inheritedLayerConditionMaskCanvas(layerId, region)
     const extracted = this.layerRegionColorMaskCanvas(layerId, region, false)
-    if (extracted.hasPixels) return this.applyRegionBlending(extracted.canvas, region)
+    if (extracted.hasPixels) return extracted.canvas
     const fallback = document.createElement('canvas')
     fallback.width = this.stageWidth
     fallback.height = this.stageHeight
@@ -6272,7 +6209,7 @@ export class RtdCanvasEditor extends LitElement {
     const fill = region.negate ? 'rgba(0,0,0,1)' : 'rgba(255,255,255,1)'
     context.fillStyle = fill
     this.fillRegionShape(context, region, rect)  // solid interior / boundary definition
-    return this.applyRegionBlending(fallback, region)
+    return fallback
   }
 
   private inheritedLayerConditionMaskCanvas(layerId: string, region: RegionItem) {
@@ -6284,83 +6221,7 @@ export class RtdCanvasEditor extends LitElement {
     const context = rendered.getContext('2d')!
     this.drawLayerCondition(context, object, layerId)
     const strength = this.clamp(region.maskStrength ?? 1, 0, 4, 1)
-    return this.applyRegionBlending(this.renderLayerAlphaMaskCanvas(rendered, region.negate, strength), region)
-  }
-
-  private applyRegionBlending(source: HTMLCanvasElement, region: RegionItem) {
-    if (!(region.blendingEnabled ?? true)) return source
-    return this.applyAlphaMaskBlending(source, region.blendingRadius ?? 32, region.blendingStrength ?? 1)
-  }
-
-  private applyAlphaMaskBlending(source: HTMLCanvasElement, blendingRadius: number, blendingStrength: number) {
-    const radius = Math.round(blendingRadius)
-    if (radius === 0) return source
-    const strength = this.clamp(blendingStrength, 0, 4, 1)
-    if (strength <= 0) return source
-    const width = source.width
-    const height = source.height
-    const blurred = document.createElement('canvas')
-    blurred.width = width
-    blurred.height = height
-    const blurredContext = blurred.getContext('2d')!
-    blurredContext.filter = `blur(${Math.abs(radius)}px)`
-    blurredContext.drawImage(source, 0, 0)
-    blurredContext.filter = 'none'
-    const output = document.createElement('canvas')
-    output.width = width
-    output.height = height
-    const outContext = output.getContext('2d')!
-    const srcData = source.getContext('2d')!.getImageData(0, 0, width, height)
-    const blurData = blurredContext.getImageData(0, 0, width, height)
-    const outData = outContext.createImageData(width, height)
-    const mix = Math.min(1, strength)
-    for (let index = 0; index < srcData.data.length; index += 4) {
-      const baseAlpha = srcData.data[index + 3]
-      const blurAlpha = blurData.data[index + 3]
-      const blended = Math.round(baseAlpha * (1 - mix) + blurAlpha * mix)
-      const alpha = radius > 0 ? Math.max(baseAlpha, blended) : Math.min(baseAlpha, blended)
-      outData.data[index] = 255
-      outData.data[index + 1] = 255
-      outData.data[index + 2] = 255
-      outData.data[index + 3] = alpha
-    }
-    outContext.putImageData(outData, 0, 0)
-    return output
-  }
-
-  private applyLumaMaskBlending(source: HTMLCanvasElement, enabled: boolean, blendingRadius: number, blendingStrength: number) {
-    if (!enabled) return source
-    if (Math.round(blendingRadius) === 0 || this.clamp(blendingStrength, 0, 4, 1) <= 0) return source
-    const alphaSource = document.createElement('canvas')
-    alphaSource.width = source.width
-    alphaSource.height = source.height
-    const sourceData = source.getContext('2d')!.getImageData(0, 0, source.width, source.height)
-    const alphaContext = alphaSource.getContext('2d')!
-    const alphaData = alphaContext.createImageData(source.width, source.height)
-    for (let index = 0; index < sourceData.data.length; index += 4) {
-      const value = this.maskValueFromPixel(sourceData.data, index)
-      alphaData.data[index] = 255
-      alphaData.data[index + 1] = 255
-      alphaData.data[index + 2] = 255
-      alphaData.data[index + 3] = value
-    }
-    alphaContext.putImageData(alphaData, 0, 0)
-    const blendedAlpha = this.applyAlphaMaskBlending(alphaSource, blendingRadius, blendingStrength)
-    const blendedData = blendedAlpha.getContext('2d')!.getImageData(0, 0, source.width, source.height).data
-    const output = document.createElement('canvas')
-    output.width = source.width
-    output.height = source.height
-    const outContext = output.getContext('2d')!
-    const outData = outContext.createImageData(source.width, source.height)
-    for (let index = 0; index < outData.data.length; index += 4) {
-      const value = blendedData[index + 3]
-      outData.data[index] = value
-      outData.data[index + 1] = value
-      outData.data[index + 2] = value
-      outData.data[index + 3] = value > 0 ? 255 : 0
-    }
-    outContext.putImageData(outData, 0, 0)
-    return output
+    return this.renderLayerAlphaMaskCanvas(rendered, region.negate, strength)
   }
 
   private hasLayerRegionMaskPixels(layerId: string, region: RegionItem) {
@@ -6404,69 +6265,43 @@ export class RtdCanvasEditor extends LitElement {
 
   private async regionChannelMaskBlob(layerId: string, region: RegionItem, channel: MaskChannel): Promise<Blob | null> {
     this.saveCurrentMaskScope()
-    const layer = this.layers.find((item) => item.id === layerId)
     const mask = channel === 'color'
-      ? region.id.startsWith('inherited:')
-        ? this.layerRegionConditionMaskCanvas(layerId, region)
-        : this.applyLumaMaskBlending(
-          this.layerRegionConditionMaskCanvas(layerId, region),
-          layer?.preset.rgbaMaskBlendingEnabled ?? false,
-          layer?.preset.rgbaMaskBlendingRadius ?? 32,
-          layer?.preset.rgbaMaskBlendingStrength ?? 1,
-        )
+      ? this.layerRegionConditionMaskCanvas(layerId, region)
       : channel === 'cfg' || channel === 'denoise'
-        ? (channel === 'cfg' ? (region.cfgMaskInherited ?? true) : (region.denoiseMaskInherited ?? true))
-          ? this.layerParameterMaskCanvas(layerId, channel)
-          : this.layerRegionConditionMaskCanvas(layerId, region)
+        ? this.layerRegionParameterMaskCanvas(layerId, region, channel)
         : this.layerRegionParameterMaskCanvas(layerId, region, channel)
     if (!mask) return null
-    if (!this.canvasHasNonZeroLuma(mask)) return null
+    if (channel === 'color' && !this.canvasHasNonZeroLuma(mask)) return null
     if (channel === 'cfg') {
-      const inherited = region.cfgMaskInherited ?? true
-      const cfgValue = inherited
-        ? (layer?.preset.layerCfg ?? layer?.preset.cfg ?? CFG_MASK_MAX)
-        : (region.regionCfg ?? layer?.preset.layerCfg ?? layer?.preset.cfg ?? CFG_MASK_MAX)
+      const cfgValue = region.regionCfg ?? CFG_FACTOR_DEFAULT
       return this.cfgMaskFloatBlob(mask, cfgValue)
     }
     return this.canvasToPngBlob(mask)
   }
 
-  private layerParameterMaskCanvas(layerId: string, channel: Extract<MaskChannel, 'cfg' | 'denoise'>): HTMLCanvasElement | null {
-    const layer = this.layers.find((item) => item.id === layerId)
-    const sourceRaw = this.existingMaskCanvasForScopeChannel(`layer:${layerId}`, channel)
-    if (!sourceRaw || !this.canvasHasNonZeroLuma(sourceRaw)) return null
-    return layer
-      ? this.applyLumaMaskBlending(
-        sourceRaw,
-        channel === 'cfg' ? layer.preset.cfgMaskBlendingEnabled : layer.preset.denoiseMaskBlendingEnabled,
-        channel === 'cfg' ? layer.preset.cfgMaskBlendingRadius : layer.preset.denoiseMaskBlendingRadius,
-        channel === 'cfg' ? layer.preset.cfgMaskBlendingStrength : layer.preset.denoiseMaskBlendingStrength,
-      )
-      : sourceRaw
-  }
-
   private layerRegionParameterMaskCanvas(layerId: string, region: RegionItem, channel: Exclude<MaskChannel, 'color'>): HTMLCanvasElement | null {
-    const layer = this.layers.find((item) => item.id === layerId)
     const sourceRaw = this.existingMaskCanvasForScopeChannel(`layer:${layerId}`, channel)
-    if (!sourceRaw || !this.canvasHasNonZeroLuma(sourceRaw)) return null
-    const source = layer && (channel === 'cfg' || channel === 'denoise')
-      ? this.applyLumaMaskBlending(
-        sourceRaw,
-        channel === 'cfg' ? layer.preset.cfgMaskBlendingEnabled : layer.preset.denoiseMaskBlendingEnabled,
-        channel === 'cfg' ? layer.preset.cfgMaskBlendingRadius : layer.preset.denoiseMaskBlendingRadius,
-        channel === 'cfg' ? layer.preset.cfgMaskBlendingStrength : layer.preset.denoiseMaskBlendingStrength,
-      )
-      : sourceRaw
-    const regionMask = this.layerRegionConditionMaskCanvas(layerId, region)
+    if (!sourceRaw) return null
     const canvas = document.createElement('canvas')
     canvas.width = this.stageWidth
     canvas.height = this.stageHeight
     const context = canvas.getContext('2d')!
-    context.drawImage(source, 0, 0)
+    context.drawImage(sourceRaw, 0, 0)
     const imageData = context.getImageData(0, 0, this.stageWidth, this.stageHeight)
-    const maskData = regionMask.getContext('2d')!.getImageData(0, 0, this.stageWidth, this.stageHeight).data
+    if (channel !== 'prompt') {
+      if (!region.id.startsWith('inherited:')) return null
+      for (let index = 0; index < imageData.data.length; index += 4) {
+        const value = Math.round(this.maskValueFromPixel(imageData.data, index))
+        imageData.data[index] = value
+        imageData.data[index + 1] = value
+        imageData.data[index + 2] = value
+        imageData.data[index + 3] = 255
+      }
+      context.putImageData(imageData, 0, 0)
+      return canvas
+    }
     for (let index = 0; index < imageData.data.length; index += 4) {
-      const value = Math.round(this.maskValueFromPixel(imageData.data, index) * (maskData[index + 3] / 255))
+      const value = Math.round(this.maskValueFromPixel(imageData.data, index))
       imageData.data[index] = value
       imageData.data[index + 1] = value
       imageData.data[index + 2] = value

@@ -112,6 +112,7 @@ function _saveOptions() {
     sceneTransparentAlphaThreshold: s.transparentAlphaThreshold,
     streamTimestepIndices: st.timestepIndices,
     streamFrameBufferSize: st.frameBufferSize,
+    streamMaxPasses: st.maxPasses,
     streamCfgType: st.cfgType,
     streamRuntimePreset: st.runtimePreset,
     streamMotionMode: st.motionMode,
@@ -206,12 +207,19 @@ function _loadOptions() {
     if (opts.sessionDirectory !== undefined) $stream.setKey('sessionDirectory', opts.sessionDirectory)
     if (opts.streamTimestepIndices !== undefined) $stream.setKey('timestepIndices', opts.streamTimestepIndices)
     if (opts.streamFrameBufferSize !== undefined) $stream.setKey('frameBufferSize', opts.streamFrameBufferSize)
+    if (opts.streamMaxPasses !== undefined) $stream.setKey('maxPasses', opts.streamMaxPasses)
     if (opts.streamCfgType !== undefined) $stream.setKey('cfgType', opts.streamCfgType)
     if (opts.streamRuntimePreset !== undefined) $stream.setKey('runtimePreset', opts.streamRuntimePreset)
     if (opts.streamMotionMode !== undefined) $stream.setKey('motionMode', opts.streamMotionMode)
     if (opts.streamMotionIntensity !== undefined) $stream.setKey('motionIntensity', opts.streamMotionIntensity)
     if (opts.streamMotionSpeed !== undefined) $stream.setKey('motionSpeed', opts.streamMotionSpeed)
-    if (opts.streamTritonCompile !== undefined) $stream.setKey('tritonCompile', opts.streamTritonCompile)
+    // Migration: keep Triton compile disabled by default for legacy option blobs.
+    // Restore persisted value only for v4+ options explicitly saved by users.
+    if ((opts.version ?? 0) >= 4 && opts.streamTritonCompile !== undefined) {
+      $stream.setKey('tritonCompile', opts.streamTritonCompile)
+    } else {
+      $stream.setKey('tritonCompile', false)
+    }
     if (opts.streamVaeMode !== undefined) $stream.setKey('vaeMode', opts.streamVaeMode)
     if (opts.streamOutputTransport !== undefined) $stream.setKey('outputTransport', opts.streamOutputTransport)
     if (opts.scenePanelTab !== undefined) $stream.setKey('scenePanelTab', opts.scenePanelTab)
@@ -310,6 +318,7 @@ export class RtdAppShell extends LitElement {
       stream_diffusion: st.scenePanelTab === 'streamdiffusion',
       stream_timestep_indices: st.timestepIndices.split(',').map(Number).filter((n: number) => !isNaN(n)),
       stream_frame_buffer_size: st.frameBufferSize,
+      stream_max_passes: st.maxPasses,
       stream_cfg_type: st.cfgType,
       stream_triton_compile: st.tritonCompile,
       stream_vae_mode: st.vaeMode,
@@ -547,10 +556,11 @@ export class RtdAppShell extends LitElement {
       else this._startStream()
     })
     this.addEventListener('rtd-send-frame', (event) => {
-      const detail = (event as CustomEvent<{ refreshResources?: boolean; refreshLayerConditions?: boolean }>).detail
+      const detail = (event as CustomEvent<{ refreshResources?: boolean; refreshLayerConditions?: boolean; liveInputChanged?: boolean }>).detail
       const refreshResources = !!detail?.refreshResources
       const refreshLayerConditions = !!detail?.refreshLayerConditions
-      requestRealtimeFrameUpdate({ refreshResources, refreshLayerConditions })
+      const liveInputChanged = !!detail?.liveInputChanged
+      requestRealtimeFrameUpdate({ refreshResources, refreshLayerConditions, liveInputChanged })
     })
     this.addEventListener('rtd-mask-select', (e) => this._editor?.selectMaskTool((e as CustomEvent<{ layerId: string; regionId?: string; channel?: MaskChannel; color?: string }>).detail))
     this.addEventListener('rtd-layer-paint-mode', (e) => this._editor?.enterPaintMode((e as CustomEvent<{ layerId?: string }>).detail?.layerId))
@@ -651,9 +661,9 @@ export class RtdAppShell extends LitElement {
     return html`<div class="shell" style="--left-w:${leftW}px; --right-w:${rightW}px">
       <header class="topbar">
         <div class="topbar-main">
-          <select class="renderer-select" .value=${st.scenePanelTab}
+          <select class="renderer-select"
             @change=${(e: Event) => $stream.setKey('scenePanelTab', (e.target as HTMLSelectElement).value as ScenePanelTab)}>
-            ${renderers.map((renderer) => html`<option value=${renderer.value}>${renderer.label}</option>`)}
+            ${renderers.map((renderer) => html`<option value=${renderer.value} ?selected=${renderer.value === st.scenePanelTab}>${renderer.label}</option>`)}
           </select>
           ${assets.isLoading ? html`<span class="status-chip">Loading…</span>` : ''}
           ${motion.isGenerating ? html`<span class="status-chip">Video…</span>` : ''}

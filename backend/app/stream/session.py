@@ -44,6 +44,14 @@ def _apply_denoise_output_blend(
     return Image.composite(output, input_rgb, denoise_blend)
 
 
+def _latent_source_image(image: Image.Image, composite_base: Image.Image | None) -> Image.Image:
+    # Always encode the user's current input as the latent anchor so StreamDiffusion
+    # conditions on what the user is actually drawing. Using the last rendered output
+    # caused the model to drift away from the user's intent over time.
+    _ = composite_base  # kept for call-site compatibility; not used
+    return image
+
+
 def _pil_rgb_to_tensor_gpu_resize(image: Image.Image, height: int, width: int, device: Any, dtype: Any, torch: Any):
     import numpy as _np
 
@@ -390,8 +398,19 @@ class StreamSession:
                 img_t = _pil_rgb_to_tensor_gpu_resize(image, self._height, self._width,
                                                        vae_dev, vae_dt, torch)
 
+            latent_source = _latent_source_image(image, composite_base)
+            if latent_source is image:
+                latent_img_t = img_t
+            elif self._ip is not None:
+                latent_img_t = self._ip.preprocess(
+                    latent_source, height=self._height, width=self._width
+                ).to(device=vae_dev, dtype=vae_dt)
+            else:
+                latent_img_t = _pil_rgb_to_tensor_gpu_resize(latent_source, self._height, self._width,
+                                                             vae_dev, vae_dt, torch)
+
             # ── VAE encode ─────────────────────────────────────────
-            img_latent = _vae_encode(vae, img_t, vsc, dev, dtype)
+            img_latent = _vae_encode(vae, latent_img_t, vsc, dev, dtype)
 
             # ── update inpaint mask latents (9-ch UNet) ────────────
             if s["is_inpaint"]:

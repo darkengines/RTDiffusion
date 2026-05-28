@@ -149,6 +149,7 @@ class DiffusionEngine:
         self._trt_runners: dict[str, Any] = {}
         self._seed_state: dict[str, object] | None = None
         self._cn_pipe_cache: dict[str, Any] = {}  # key = cn_model_id → wrapped pipeline
+        self._z_image_cfg_mask_warned = False
         # Per-frame step progress — updated by on_step_end, polled by GET /system/tasks
         self._inpaint_step_info: dict = {"step": 0, "total": 0, "active": False, "device": self.config.device}
         self._load_pipeline()
@@ -230,7 +231,13 @@ class DiffusionEngine:
             if self.config.attention_slicing and hasattr(pipe, "enable_attention_slicing"):
                 pipe.enable_attention_slicing()
                 logger.info("Attention slicing enabled")
-            if hasattr(pipe, "enable_xformers_memory_efficient_attention"):
+            if self.pipeline_family == "z-image":
+                # Z-Image uses model-specific attention kwargs (e.g. ``freqs_cis``).
+                # Do not toggle xformers/SDPA processors here: forcing generic
+                # AttnProcessor variants can drop those kwargs and produce blocky
+                # checkerboard artifacts. Keep pipeline-native attention as loaded.
+                logger.info("Z-Image: preserving native attention processors (skip xformers/SDPA toggles)")
+            elif hasattr(pipe, "enable_xformers_memory_efficient_attention"):
                 try:
                     pipe.enable_xformers_memory_efficient_attention()
                     logger.info("xformers memory-efficient attention enabled")
@@ -325,9 +332,13 @@ class DiffusionEngine:
     def _load_pipe(pipeline_class, model_id: str, dtype, variant: str | None):
         return load_pretrained_pipe(pipeline_class, model_id, dtype, variant=variant, logger=logger)
 
-    @staticmethod
-    def _load_single_file_pipe(pipeline_class, model_id: str, dtype):
-        return load_single_file_pipe(pipeline_class, model_id, dtype)
+    def _load_single_file_pipe(self, pipeline_class, model_id: str, dtype):
+        return load_single_file_pipe(
+            pipeline_class,
+            model_id,
+            dtype,
+            local_files_only=self.config.z_image_local_only if self._looks_like_z_image_model(model_id) else None,
+        )
 
     def _load_z_image_single_file_pipe(self, pipeline_class, model_id: str, dtype):
         from diffusers import AutoencoderKL, FlowMatchEulerDiscreteScheduler
@@ -335,20 +346,35 @@ class DiffusionEngine:
 
         base_model = self.config.z_image_base_model
         local_files_only = self.config.z_image_local_only
-        text_encoder = Qwen3Model.from_pretrained(base_model, subfolder="text_encoder", torch_dtype=dtype, local_files_only=local_files_only)
-        tokenizer = Qwen2Tokenizer.from_pretrained(base_model, subfolder="tokenizer", local_files_only=local_files_only)
-        vae = AutoencoderKL.from_pretrained(base_model, subfolder="vae", torch_dtype=dtype, local_files_only=local_files_only)
-        scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(base_model, subfolder="scheduler", local_files_only=local_files_only)
-        return pipeline_class.from_single_file(
-            str(Path(model_id)),
-            torch_dtype=dtype,
-            local_files_only=True,
-            use_safetensors=Path(model_id).suffix.lower() == ".safetensors",
-            text_encoder=text_encoder,
-            tokenizer=tokenizer,
-            vae=vae,
-            scheduler=scheduler,
-        )
+        try:
+            text_encoder = Qwen3Model.from_pretrained(base_model, subfolder="text_encoder", torch_dtype=dtype, local_files_only=local_files_only)
+            tokenizer = Qwen2Tokenizer.from_pretrained(base_model, subfolder="tokenizer", local_files_only=local_files_only)
+            vae = AutoencoderKL.from_pretrained(base_model, subfolder="vae", torch_dtype=dtype, local_files_only=local_files_only)
+            scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(base_model, subfolder="scheduler", local_files_only=local_files_only)
+            return pipeline_class.from_single_file(
+                str(Path(model_id)),
+                torch_dtype=dtype,
+                local_files_only=local_files_only,
+                use_safetensors=Path(model_id).suffix.lower() == ".safetensors",
+                text_encoder=text_encoder,
+                tokenizer=tokenizer,
+                vae=vae,
+                scheduler=scheduler,
+            )
+        except Exception as exc:
+            message = str(exc)
+            if "LocalEntryNotFoundError" in message or "Cannot find an appropriate cached snapshot" in message:
+                raise RuntimeError(
+                    "Z-Image base artifacts are missing from local cache while offline mode is active. "
+                    "Set RTD_Z_IMAGE_LOCAL_ONLY=0 to allow Hub downloads, or pre-cache the base model "
+                    f"'{base_model}' before running offline."
+                ) from exc
+            if "WinError 1314" in message or "os.symlink" in message:
+                raise RuntimeError(
+                    "Z-Image model download failed on Windows due to symlink privilege error (WinError 1314). "
+                    "Enable Developer Mode or run with symlink privileges, then retry."
+                ) from exc
+            raise
 
     @staticmethod
     def _looks_like_sdxl_checkpoint(model_path: Path) -> bool:
@@ -698,6 +724,12 @@ class DiffusionEngine:
             if influence <= 0.002:
                 continue
             if condition.prompt.strip() and alpha is not None:
+                if self.pipeline_family == "z-image":
+                    # Z-Image regional prompting is applied as explicit masked
+                    # regional inpaint passes later in _apply_layer_region_conditions.
+                    # Skip global prompt concatenation here to avoid doubling the
+                    # same regional intent in both global and regional paths.
+                    continue
                 region_prompt = self._regional_prompt_text(condition.prompt.strip(), alpha, frame.width, frame.height, self.pipeline_family == "z-image")
                 if self.pipeline_family == "z-image":
                     z_image_layout_parts.append(region_prompt)
@@ -852,8 +884,14 @@ class DiffusionEngine:
         conditions = sorted(frame.layer_conditions, key=lambda item: item.z_index if item.z_index is not None else 0)
         for condition in conditions:
             mode = condition.mode if condition.mode in {"mask", "add", "multiply", "override"} else "prompt_mix"
-            if mode == "prompt_mix":
+            z_image_prompt_mix_region = (
+                self.pipeline_family == "z-image"
+                and mode == "prompt_mix"
+                and bool((condition.prompt or "").strip())
+            )
+            if mode == "prompt_mix" and not z_image_prompt_mix_region:
                 continue
+            composite_mode = "mask" if z_image_prompt_mix_region else mode
             if mode == "mask":
                 denoise = condition.denoise if condition.denoise is not None else frame.strength
                 denoise = max(0.0, min(0.999, denoise))
@@ -877,7 +915,13 @@ class DiffusionEngine:
                 logger.exception("Failed to decode regional layer condition image")
                 continue
             alpha = condition_image.getchannel("A")
-            if not alpha.getbbox():
+            region_prompt_mask: Image.Image | None = None
+            if condition.prompt_mask:
+                try:
+                    region_prompt_mask = _decode_luma_mask_data_url(condition.prompt_mask, frame.width, frame.height)
+                except Exception:
+                    logger.warning("Failed to decode prompt mask for %s", condition.name or condition.layer_id, exc_info=True)
+            if region_prompt_mask is None and not alpha.getbbox():
                 continue
             schedule_active = self._schedule_influence(condition.schedule, condition.schedule_start, condition.schedule_end) > 0
             if not schedule_active:
@@ -887,6 +931,8 @@ class DiffusionEngine:
                 return int(max(0.0, min(1.0, (value / 255) * condition.weight)) * 255)
 
             prompt_mask = alpha.point(scale_alpha)
+            if region_prompt_mask is not None:
+                prompt_mask = region_prompt_mask.point(scale_alpha)
             if not prompt_mask.getbbox():
                 continue
             condition_source = current
@@ -917,7 +963,7 @@ class DiffusionEngine:
                     "lora_paths": condition.lora_paths or frame.lora_paths,
                     "cfg": condition_cfg,
                     "steps": condition.steps if condition.steps is not None else frame.steps,
-                    "strength": denoise if mode == "mask" else denoise,
+                    "strength": denoise,
                     "sampler": condition.sampler or frame.sampler,
                     "scheduler": condition.scheduler or frame.scheduler,
                     "layer_conditions": [],
@@ -943,14 +989,19 @@ class DiffusionEngine:
                         regional = self._diffusers_inpaint(condition_source, prompt_mask, condition_frame)
                 else:
                     regional = self._diffusers_inpaint(condition_source, prompt_mask, condition_frame)
-            current = self._composite_region_condition(current, regional, influence_mask, mode)
+            current = self._composite_region_condition(current, regional, influence_mask, composite_mode)
         return current
 
-    @staticmethod
-    def _condition_effective_cfg(condition: "LayerCondition", fallback_cfg: float, width: int, height: int) -> float:
+    def _condition_effective_cfg(self, condition: "LayerCondition", fallback_cfg: float, width: int, height: int) -> float:
         cfg = condition.cfg if condition.cfg is not None else fallback_cfg
         if not condition.cfg_mask:
             return cfg
+        if self.pipeline_family == "z-image" and not self._z_image_cfg_mask_warned:
+            logger.warning(
+                "Z-Image received cfg_mask guidance; current backend reduces cfg_mask to a scalar per region. "
+                "Per-pixel CFG-map guidance is not implemented for Z-Image yet."
+            )
+            self._z_image_cfg_mask_warned = True
         try:
             mask = _decode_cfg_mask_data_url(condition.cfg_mask, width, height)
         except Exception:
@@ -985,6 +1036,7 @@ class DiffusionEngine:
         current = output.convert("RGB")
         original = original_image.convert("RGB")
         conditions = sorted(frame.layer_conditions, key=lambda item: item.z_index if item.z_index is not None else 0)
+        blended_layers = 0
         for condition in conditions:
             mode = condition.mode if condition.mode in {"mask", "add", "multiply", "override"} else "prompt_mix"
             if mode != "mask":
@@ -1008,6 +1060,24 @@ class DiffusionEngine:
             alpha_arr = _np.asarray(alpha, dtype=_np.uint8)
             if not bool(((alpha_arr > 0) & (alpha_arr < 255)).any()):
                 continue
+            if condition.denoise_mask:
+                try:
+                    denoise_mask = decode_data_url(condition.denoise_mask).convert("L").resize(
+                        (frame.width, frame.height), Image.Resampling.BILINEAR
+                    )
+                    denoise_arr = _np.asarray(denoise_mask, dtype=_np.float32) / 255.0
+                    alpha_arr = (_np.asarray(alpha_arr, dtype=_np.float32) * denoise_arr).clip(0, 255).astype(_np.uint8)
+                except Exception:
+                    logger.exception("Failed to decode denoise mask for soft-alpha compositing")
+                    continue
+            if not alpha_arr.any():
+                continue
+            blended_layers += 1
+            if blended_layers > 1:
+                # Re-blending multiple feathered mask layers against the original input can
+                # reintroduce prior content at overlaps/edges (visible alpha halos).
+                # Skip this post-pass in multi-layer cases to preserve the generated result.
+                return output.convert("RGB")
             current_arr = _np.asarray(current, dtype=_np.float32)
             original_arr = _np.asarray(original, dtype=_np.float32)
             alpha_f = alpha_arr.astype(_np.float32)[:, :, _np.newaxis] / 255.0
@@ -2372,6 +2442,12 @@ class DiffusionEngine:
         negative_prompt: str | None,
         guidance_scale: float,
     ) -> RegionalAttentionSpec | None:
+        if self.pipeline_family == "z-image":
+            # Current regional-attention wrapper swaps UNet processors and can
+            # force generic AttnProcessor variants that ignore Z-Image kwargs
+            # like ``freqs_cis``. Until a Z-Image-specific adapter exists,
+            # disable processor-level regional attention for this backend.
+            return None
         if guidance_scale <= 1.0:
             return None
         pipe = cast(Any, self.pipe)

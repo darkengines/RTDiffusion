@@ -274,6 +274,8 @@ export class RtdScenePanel extends LitElement {
         </label>
         <rtd-number label="Frame buffer" .value=${st.frameBufferSize} min="1" max="4" step="1" decimals="0"
           @rtd-change=${(e: CustomEvent) => $stream.setKey('frameBufferSize', Math.round(clamp(e.detail.value, 1, 4, st.frameBufferSize)))}></rtd-number>
+        <rtd-number label="Max passes" .value=${st.maxPasses} min="1" max="128" step="1" decimals="0"
+          @rtd-change=${(e: CustomEvent) => $stream.setKey('maxPasses', Math.round(clamp(e.detail.value, 1, 128, st.maxPasses)))}></rtd-number>
         <label class="field inline">
           <span>Guidance mode</span>
           <select .value=${st.cfgType}

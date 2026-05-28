@@ -326,6 +326,19 @@ describe('startInpaintStream live staging behavior', () => {
     expect(nextLabels).toHaveLength(0)
   })
 
+  it('registers signal debug surfaces while streaming even when debug mode is off', async () => {
+    const service = await import('./services/stream.service')
+    $stream.set({
+      ...$stream.get(),
+      isStreaming: true,
+      debugStreamsEnabled: false,
+    })
+
+    service.registerDebugStreamSurface('signal-1', 'signal-1', {} as MediaStream)
+
+    expect(service.getDebugSurfaces().has('signal-1')).toBe(true)
+  })
+
   it('routes unified realtime updates to the inpaint websocket when WebRTC is inactive', async () => {
     const service = await import('./services/stream.service')
     let prompt = 'initial'
@@ -439,7 +452,54 @@ describe('render session WebSocket server-driven input readiness', () => {
 
     expect(exportCount).toBe(2)
     expect(socket.sent).toHaveLength(2)
-    expect(((socket.sent[1].scene as Record<string, unknown>).settings as Record<string, unknown>).prompt).toBe('input-c')
+    expect(socket.sent[1].type).toBe('scene_patch')
+    expect(((socket.sent[1].patch as Record<string, unknown>).settings as Record<string, unknown>).prompt).toBe('input-c')
+  })
+
+  it('debounces rapid settings updates per event type and keeps only the latest scene state', async () => {
+    const service = await import('./services/stream.service')
+    let prompt = 'input-a'
+    let settingsExportCount = 0
+    service.wireFullFrameExporter(async () => ({
+      image: IMAGE_RESOURCE,
+      mask: MASK_RESOURCE,
+      prompt,
+      width: 512,
+      height: 512,
+    }))
+    service.wireSceneSettingsExporter(async () => {
+      settingsExportCount++
+      return {
+        prompt,
+        width: 512,
+        height: 512,
+      }
+    })
+
+    await service.startWebRtc()
+    const socket = sockets[0]
+    socket.onopen?.()
+    socket.onmessage?.({ data: JSON.stringify({ type: 'hello', session_id: 'session-a' }) })
+    socket.onmessage?.({ data: JSON.stringify({ type: 'input_ready', reason: 'session_started' }) })
+    await waitForSent(socket, 1)
+
+    socket.onmessage?.({ data: JSON.stringify({ type: 'input_ready', reason: 'rendered' }) })
+    await flushTimers()
+
+    prompt = 'input-b'
+    service.requestRealtimeFrameUpdate()
+    await wait(10)
+    prompt = 'input-c'
+    service.requestRealtimeFrameUpdate()
+    await wait(10)
+    prompt = 'input-d'
+    service.requestRealtimeFrameUpdate()
+    await wait(80)
+
+    expect(settingsExportCount).toBe(1)
+    expect(socket.sent).toHaveLength(2)
+    expect(socket.sent[1].type).toBe('scene_patch')
+    expect(((socket.sent[1].patch as Record<string, unknown>).settings as Record<string, unknown>).prompt).toBe('input-d')
   })
 
   it('stores RTC frame timing metadata independently of image transport', async () => {
@@ -640,7 +700,7 @@ describe('render session WebSocket server-driven input readiness', () => {
     const debugNames = [...debugResources.keys()]
     expect(debugNames).toEqual(expect.arrayContaining([
       'layer-a/RGBA',
-      'layer-a/RGBAPrompt',
+      'layer-a/RGBAMask',
       'layer-a/Prompt1',
       'layer-a/CFG',
       'layer-a/Denoise',

@@ -19,6 +19,7 @@ export interface StreamState {
   runtimePreset: StreamRuntimePreset
   timestepIndices: string
   frameBufferSize: number
+  maxPasses: number
   cfgType: string
   motionMode: StreamMotionMode
   motionIntensity: number
@@ -50,6 +51,7 @@ export const $stream = map<StreamState>({
   runtimePreset: 'diffusers',
   timestepIndices: '16,32',
   frameBufferSize: 1,
+  maxPasses: 16,
   cfgType: 'self',
   motionMode: 'none',
   motionIntensity: 0.35,

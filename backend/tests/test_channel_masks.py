@@ -20,6 +20,7 @@ from app.composition import (
     Region,
     RendererSupport,
     Scene,
+    aggregate_channel_mask,
     _region_channel_mask,
     _region_effective_alpha,
     build_layered_pass,
@@ -119,6 +120,28 @@ class TestPerChannelEffectiveAlpha:
 # ── Decoupled aggregation through single-pass ────────────────────────────────
 
 class TestSinglePassChannelDecoupling:
+    def test_prompt_mask_does_not_change_rgba_or_denoise_aggregates(self):
+        region = Region(
+            mask=_full(255),
+            prompt="fire",
+            prompt_mask=_right_half(255),
+        )
+        scene = Scene(
+            layers=(Layer(regions=(region,)),),
+            width=W, height=H,
+            base_denoise=1.0,
+        )
+        plan, _ = build_single_pass(scene, RendererSupport())
+
+        rgba_arr = np.asarray(plan.mask, dtype=np.float32) / 255.0
+        denoise_arr = np.asarray(plan.denoise_map, dtype=np.float32) / 255.0
+        prompt_arr = np.asarray(aggregate_channel_mask(scene, "prompt"), dtype=np.float32) / 255.0
+
+        assert np.allclose(rgba_arr, 1.0)
+        assert np.allclose(denoise_arr, 1.0)
+        assert np.allclose(prompt_arr[:, : W // 2], 0.0)
+        assert np.allclose(prompt_arr[:, W // 2 :], 1.0)
+
     def test_denoise_and_prompt_can_target_different_halves(self):
         """Region covers the full canvas with denoise_mask=LEFT and
         prompt_mask=RIGHT. The aggregated denoise map only shows up on the

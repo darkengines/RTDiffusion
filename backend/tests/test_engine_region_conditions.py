@@ -6,7 +6,8 @@ import io
 import pytest
 from PIL import Image
 
-from app.engine import DiffusionEngine, EngineConfig
+from app.engine.config import EngineConfig
+from app.engine.engine import DiffusionEngine
 from app.engine.regional_attention import RegionalAttentionRegion, RegionalAttentionSpec, regional_attention_context
 from app.schemas import InpaintFrame, LayerCondition
 
@@ -34,6 +35,12 @@ def _condition(layer_id: str, z_index: int, prompt: str, alpha: Image.Image) -> 
         schedule_start=0,
         schedule_end=1,
     )
+
+
+def _prompt_mask_condition(layer_id: str, z_index: int, prompt: str, alpha: Image.Image, prompt_mask: Image.Image) -> LayerCondition:
+    return _condition(layer_id, z_index, prompt, alpha).model_copy(update={
+        "prompt_mask": _png_url(prompt_mask),
+    })
 
 
 def _frame(conditions: list[LayerCondition]) -> InpaintFrame:
@@ -144,6 +151,33 @@ def test_denoise_override_scales_regional_composite(monkeypatch) -> None:
     assert pixel[0] == pytest.approx(101, abs=2)
     assert pixel[1] == pytest.approx(141, abs=2)
     assert pixel[2] == pytest.approx(128, abs=2)
+
+
+def test_explicit_prompt_mask_is_not_gated_by_rgba_alpha(monkeypatch) -> None:
+    engine = DiffusionEngine(EngineConfig(device="cpu"))
+    empty = Image.new("L", (256, 256), 0)
+    left = Image.new("L", (256, 256), 0)
+    left.paste(255, (0, 0, 128, 256))
+    captured_masks: list[Image.Image] = []
+    calls: list[str] = []
+
+    def fake_inpaint(image: Image.Image, mask: Image.Image, frame: InpaintFrame) -> Image.Image:
+        calls.append(frame.prompt)
+        captured_masks.append(mask.copy())
+        return Image.new("RGB", image.size, (20, 180, 130))
+
+    monkeypatch.setattr(engine, "_diffusers_inpaint", fake_inpaint)
+    engine.pipe = object()
+    condition = _prompt_mask_condition("bottom", 0, "cat", empty, left)
+    frame = _frame([condition])
+
+    output = engine._apply_layer_region_conditions(Image.new("RGB", (256, 256), (128, 128, 128)), frame)
+
+    assert calls == ["cat"]
+    assert captured_masks
+    assert captured_masks[0].getpixel((64, 64)) == 255
+    assert captured_masks[0].getpixel((192, 64)) == 0
+    assert output.getpixel((64, 64)) == (20, 180, 130)
 
 
 def test_generate_preserves_relative_denoise_in_inpaint_mask(monkeypatch) -> None:

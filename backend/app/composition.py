@@ -333,11 +333,11 @@ def _mask_to_alpha(mask: Image.Image | None, width: int, height: int) -> np.ndar
 
 
 def _mask_to_cfg_values(mask: Image.Image, width: int, height: int) -> np.ndarray:
-    """Decode an explicit CFG mask as absolute CFG values.
+    """Decode an explicit CFG mask as multiplicative CFG factors.
 
-    F-mode masks carry CFG units directly. 16-bit and 8-bit masks carry a
-    normalized 0..CFG_HI value. This keeps older PNG masks working while the
-    realtime path can use float32 without quantizing CFG into one byte.
+    F-mode masks carry factor units directly (1.0 means unchanged CFG).
+    16-bit and 8-bit masks carry normalized 0..CFG_HI factors. The realtime
+    path uses float32 so factors can exceed 1.0 without quantization.
     """
     if mask.mode == "F":
         if mask.size != (width, height):
@@ -381,9 +381,9 @@ def _region_key(layer_id: str, region_id: str) -> str:
 def _region_channel_mask(region: Region, channel: str) -> Image.Image | None:
     """Resolve the mask for a specific channel of a region, with fallback.
 
-    Lookup order: explicit per-channel attribute → this region's ``color_mask``
-    → ``region.mask`` (legacy layer-level single mask). Returns ``None`` only
-    if no mask is set (uniform application).
+    Lookup order: explicit per-channel attribute. The RGBA/color channel keeps
+    the legacy fallback to ``color_mask``/``region.mask``; the other channels
+    are independent and must not implicitly inherit RGBA alpha.
 
     Channels: ``color``/``color_mask``, ``denoise``/``denoise_mask``,
     ``prompt``/``prompt_mask``, ``cfg``/``cfg_mask``.
@@ -393,9 +393,11 @@ def _region_channel_mask(region: Region, channel: str) -> Image.Image | None:
         specific = getattr(region, attr, None)
         if specific is not None:
             return specific
-    if channel not in ("color", "color_mask") and region.color_mask is not None:
-        return region.color_mask
-    return region.mask
+    if channel in ("color", "color_mask"):
+        if region.color_mask is not None:
+            return region.color_mask
+        return region.mask
+    return None
 
 
 def _region_effective_alpha(
@@ -450,10 +452,9 @@ def aggregate_numeric(
             continue
         v = float(value)
         if op is NumericOp.REPLACE:
-            # Smooth alpha-weighted replacement so feathered masks don't
-            # produce hard binary jumps.
-            new = acc * (1.0 - alpha) + v * alpha
-            acc = np.where(active, new, acc)
+            # Deterministic factor-map semantics: REPLACE uses v * alpha.
+            # This keeps denoise/cfg masks as direct scalar factors.
+            acc = np.where(active, v * alpha, acc)
         elif op is NumericOp.ADD:
             acc = np.where(active, acc + v * alpha, acc)
         elif op is NumericOp.AVERAGE:
@@ -485,11 +486,15 @@ def aggregate_cfg(
             scaled = np.asarray(value, dtype=np.float32)
             if scaled.shape != acc.shape:
                 raise ValueError(f"cfg value shape {scaled.shape} != acc shape {acc.shape}")
-            scaled = scaled * alpha
         else:
             scaled = float(value) * alpha
         if op is NumericOp.REPLACE:
-            acc = np.where(active, scaled, acc)
+            if absolute:
+                # Treat cfg masks as multiplicative factors over current cfg.
+                factor = 1.0 + (scaled - 1.0) * alpha
+                acc = np.where(active, acc * factor, acc)
+            else:
+                acc = np.where(active, scaled, acc)
         elif op is NumericOp.ADD:
             acc = np.where(active, acc + scaled, acc)
         elif op is NumericOp.AVERAGE:
@@ -573,6 +578,23 @@ def aggregate_prompt(
         else:  # pragma: no cover
             raise ValueError(f"unknown prompt op {op!r}")
     return acc
+
+
+def aggregate_channel_mask(scene: Scene, channel: str) -> Image.Image:
+    """Aggregate a channel's effective alpha into one preview mask.
+
+    This is intended for debug/signal surfaces. It preserves the channel
+    decoupling semantics of the composition model: prompt/cfg/denoise masks do
+    not implicitly inherit from other channels, while color uses the region's
+    visible alpha fallback.
+    """
+    w, h = scene.width, scene.height
+    contribs = [
+        (_region_effective_alpha(region, w, h, channel), region.mask_op)
+        for layer in scene.layers
+        for region in layer.regions
+    ]
+    return _arr_to_l(aggregate_mask(contribs, w, h))
 
 
 # ── Single-pass plan builder ──────────────────────────────────────────────────
@@ -720,10 +742,12 @@ def build_layered_pass(
                 cfg_values = _mask_to_cfg_values(region.cfg_mask, w, h)
                 active_cfg = cfg_values[cfg_values > MASK_ACTIVE_EPSILON]
                 if active_cfg.size:
-                    cfg = float(active_cfg.max())
+                    cfg = float(cfg * active_cfg.max())
             # The per-region inpaint pass is driven by the prompt channel
             # mask. Falls back to the legacy single-mask if no prompt_mask is
             # provided. Per the layered-pass semantics in §8.2 of the spec.
+            # Each channel mask is a final, standalone mask sent by the client
+            # and must be used as-is without intersection with other channels.
             alpha = _region_effective_alpha(region, w, h, "prompt")
             if not (alpha > MASK_ACTIVE_EPSILON).any():
                 continue
@@ -1094,6 +1118,7 @@ __all__ = [
     "CompositionPlan",
     "aggregate_numeric",
     "aggregate_mask",
+    "aggregate_channel_mask",
     "aggregate_prompt",
     "build_single_pass",
     "build_layered_pass",

@@ -397,6 +397,7 @@ export type StoredOptions = Partial<{
   sceneTransparentAlphaThreshold: number
   streamTimestepIndices: string
   streamFrameBufferSize: number
+  streamMaxPasses: number
   streamCfgType: string
   streamRuntimePreset: StreamRuntimePreset
   streamMotionMode: StreamMotionMode

@@ -17,6 +17,20 @@ class _LoggerLike(Protocol):
     def warning(self, msg: str, *args: object) -> None: ...
 
 
+def _env_truthy(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).strip().lower() not in ("0", "false", "no", "")
+
+
+def single_file_local_only_default() -> bool:
+    """Return the default local-only policy for single-file checkpoint loading.
+
+    By default we prefer online cache resolution for missing config artifacts
+    because many single-file checkpoints still need pipeline config from Hub.
+    Set RTD_SINGLE_FILE_LOCAL_ONLY=1 to force strict offline behavior.
+    """
+    return _env_truthy("RTD_SINGLE_FILE_LOCAL_ONLY", "0")
+
+
 def default_device() -> str:
     value = os.getenv("RTD_DEVICE", "cuda").strip().lower()
     return "cuda:0" if value == "cuda" else value
@@ -106,14 +120,21 @@ def load_pretrained_pipe(
         )
 
 
-def load_single_file_pipe(pipeline_class: Any, model_id: str, dtype: Any) -> Any:
-    """Load a diffusers single-file checkpoint with local-only resolution."""
+def load_single_file_pipe(
+    pipeline_class: Any,
+    model_id: str,
+    dtype: Any,
+    *,
+    local_files_only: bool | None = None,
+) -> Any:
+    """Load a diffusers single-file checkpoint with configurable cache policy."""
     model_path = Path(model_id)
+    local_only = single_file_local_only_default() if local_files_only is None else bool(local_files_only)
     try:
         return pipeline_class.from_single_file(
             str(model_path),
             torch_dtype=dtype,
-            local_files_only=True,
+            local_files_only=local_only,
             use_safetensors=model_path.suffix.lower() == ".safetensors",
         )
     except Exception as exc:
@@ -123,5 +144,17 @@ def load_single_file_pipe(pipeline_class: Any, model_id: str, dtype: Any) -> Any
                 f"{model_path.name} is not a complete Stable Diffusion image checkpoint. "
                 "It is missing text encoder weights, so Diffusers cannot load it as an inpaint/img2img pipeline. "
                 "Choose a full SD/SDXL checkpoint or set RTD_MODEL_PATH to a known inpaint checkpoint."
+            ) from exc
+        if "LocalEntryNotFoundError" in message or "Cannot find an appropriate cached snapshot" in message:
+            raise RuntimeError(
+                "Single-file checkpoint requires additional Diffusers config that is not in the local cache. "
+                "Either allow online lookups (RTD_SINGLE_FILE_LOCAL_ONLY=0) or pre-cache the required Hub repo "
+                "before running offline."
+            ) from exc
+        if "WinError 1314" in message or "os.symlink" in message:
+            raise RuntimeError(
+                "Hugging Face cache symlink creation failed on Windows (WinError 1314). "
+                "Enable Developer Mode or run with symlink privileges, then retry. "
+                "As an alternative, use fully local model folders that do not require Hub snapshot materialization."
             ) from exc
         raise

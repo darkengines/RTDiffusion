@@ -26,7 +26,7 @@ from typing import Any
 
 from PIL import Image
 
-from .image_io import decode_data_url
+from .image_io import decode_data_url, decode_data_url_rgba, rgba_to_neutral_rgb
 
 logger = logging.getLogger("rtdiffusion.controlnet")
 
@@ -799,7 +799,7 @@ def resolve_control_image(
 
     if condition.controlnet_image:
         try:
-            img = decode_data_url(condition.controlnet_image).convert("RGB")
+            img = rgba_to_neutral_rgb(decode_data_url_rgba(condition.controlnet_image))
             return img.resize((width, height), Image.LANCZOS)
         except Exception as exc:
             logger.warning("ControlNet: failed to decode controlnet_image: %s", exc)
@@ -809,7 +809,7 @@ def resolve_control_image(
     src_image = layer_image
     if getattr(condition, "controlnet_use_layer_frame", False):
         try:
-            src_image = decode_data_url(condition.image).convert("RGB")
+            src_image = rgba_to_neutral_rgb(decode_data_url_rgba(condition.image))
         except Exception:
             pass  # fallback to layer_image if decode fails
 

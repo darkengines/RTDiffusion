@@ -5,7 +5,7 @@ import { ARCHIVE_ROOT_URL, CANVAS_CUSTOM_PROPERTIES } from '../project-state'
 export { ARCHIVE_ROOT_URL as ARCHIVE_ROOT, CANVAS_CUSTOM_PROPERTIES }
 
 export const OPTIONS_KEY = 'rtdiffusion.options.v1'
-export const OPTIONS_VERSION = 3
+export const OPTIONS_VERSION = 4
 export const PROJECT_STATE_KEY = 'rtdiffusion.projectState.v1'
 export const PROJECT_RESOURCE_PREFIX = 'rtdiffusion.resource.v1.'
 export const PROJECT_RESOURCE_DB = 'rtdiffusion.resources.v1'

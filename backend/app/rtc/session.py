@@ -18,6 +18,7 @@ from ..stream import SessionManager as _SessionManager
 from ..stream.helpers import _TRITON_OK as _STREAM_TRITON_OK
 from ..pipeline_graph import SessionGraph, GraphResult, resolve_conditioning_mask
 from ..composition import (
+    CFG_HI,
     RenderMode,
     RendererSupport,
     compose,
@@ -120,6 +121,31 @@ def _neutral_rgb(img: Image.Image, neutral: tuple[int, int, int] = (128, 128, 12
     return Image.alpha_composite(background, rgba).convert("RGB")
 
 
+def _images_equal(left: Image.Image | None, right: Image.Image | None) -> bool:
+    if left is None or right is None:
+        return False
+    if left.size != right.size or left.mode != right.mode:
+        return False
+    try:
+        return ImageChops.difference(left, right).getbbox() is None
+    except Exception:
+        return False
+
+
+def _empty_alpha_as_denoise_mask(img: Image.Image) -> Image.Image | None:
+    """Return white-act mask for transparent pixels (alpha==0 => 255).
+
+    This mirrors the inpaint engine behavior where empty canvas regions should be
+    fully denoised from noise rather than inheriting any source RGB value.
+    """
+    if img.mode not in ("RGBA", "LA") and "transparency" not in img.info:
+        return None
+    rgba = img.convert("RGBA")
+    alpha = rgba.getchannel("A")
+    empty = ImageChops.invert(alpha)
+    return empty if empty.getbbox() else None
+
+
 def _parse_debug_color(value: object, fallback: tuple[int, int, int] = (255, 255, 255)) -> tuple[int, int, int]:
     text = str(value or "").strip().lstrip("#")
     if len(text) == 3:
@@ -145,6 +171,37 @@ def _tinted_mask_preview(img: Image.Image, color: object) -> Image.Image:
     return Image.fromarray(np.clip(tinted, 0, 255).astype(np.uint8), "RGB")
 
 
+def _compose_region_color_preview(scene: Any, width: int, height: int) -> Image.Image:
+    result = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    for layer in scene.layers:
+        for region in layer.regions:
+            if region.color is None:
+                continue
+            mask = region.color_mask if region.color_mask is not None else region.mask
+            if mask is None:
+                mask = Image.new("L", (width, height), 255)
+            else:
+                mask = mask.convert("L")
+                if mask.size != (width, height):
+                    mask = mask.resize((width, height), Image.Resampling.NEAREST)
+            if mask.getbbox() is None:
+                continue
+            color = region.color.convert("RGBA")
+            if color.size != (width, height):
+                color = color.resize((width, height), Image.Resampling.BILINEAR)
+            alpha = ImageChops.multiply(color.getchannel("A"), mask)
+            color.putalpha(alpha)
+            result = Image.alpha_composite(result, color)
+    return result
+
+
+def _cfg_factor_preview(cfg_map: Image.Image) -> Image.Image:
+    values = np.asarray(cfg_map.convert("L"), dtype=np.float32) / 255.0 * CFG_HI
+    preview = np.clip(values, 0.0, 1.0) * 255.0
+    preview = np.where(values >= 0.9, 255.0, preview)
+    return Image.fromarray(preview.round().astype(np.uint8), "L").convert("RGB")
+
+
 def _encode_debug_channels(
     debug_channels: dict[str, Image.Image],
     *,
@@ -157,7 +214,10 @@ def _encode_debug_channels(
     for ch_name, ch_img in debug_channels.items():
         if not include_images and ch_name not in (always_include or set()):
             continue
-        payload[ch_name] = f"stream:{ch_name}"
+        try:
+            payload[ch_name] = _data_url("image/png", _png_bytes(ch_img))
+        except Exception:
+            payload[ch_name] = _data_url("image/png", _png_bytes(ch_img.convert("RGB")))
     return payload
 
 
@@ -316,6 +376,7 @@ class InpaintSession:
         # Canvas image cache — skip base64/image decode when the URL hasn't changed
         self._cached_canvas_url: str = ""
         self._cached_canvas_img: Image.Image | None = None
+        self._cached_canvas_empty_mask: Image.Image | None = None
 
         # Layer frame cache — keyed by layer_id, value (url, decoded_image)
         self._layer_frames_url: dict[str, str] = {}  # set O(1) in event loop
@@ -353,16 +414,80 @@ class InpaintSession:
 
         # Pipeline state — written in thread pool, read in event loop (GIL-safe for simple assigns)
         self._pipeline_status: str = "idle"   # idle | loading | ready | error
+        self._pipeline_renderer: str = "idle"
         self._pipeline_model: str = ""
         self._pipeline_error: str = ""
         self._pipeline_fps: float = 0.0
         self._pipeline_compile_status: dict[str, object] = {}
+        self._render_dispatch_count: int = 0
+        self._render_success_count: int = 0
+        self._render_stale_count: int = 0
+        self._render_skip_count: int = 0
+        self._last_completed_generation: int = 0
+        self._active_inference_started_perf: float = 0.0
+        self._active_inference_generation: int = 0
+        self._last_queue_wait_ms: float = 0.0
+        self._last_latency_ms: float = 0.0
+        self._last_end_to_end_ms: float = 0.0
 
         self._session_manager = _shared_session_manager
 
     @property
     def output_transport(self) -> str:
         return self._output_transport
+
+    def telemetry_snapshot(self) -> dict[str, Any]:
+        session = getattr(self._session_manager, "_session", None)
+        engine = getattr(session, "engine", None)
+        step_info = engine.inpaint_step_info if engine is not None else {}
+        active_for_ms = 0.0
+        inference_active = self._active_inference_started_perf > 0.0
+        if inference_active:
+            active_for_ms = max(0.0, (time.perf_counter() - self._active_inference_started_perf) * 1000.0)
+        generation_backlog = max(0, int(self._input_generation) - int(self._last_completed_generation))
+        queued_trigger_count = 1 if self._input_event.is_set() else 0
+        pending_live_media = 1 if self._pending_live_media_revision > 0 else 0
+        inflight_count = 1 if inference_active else 0
+        pending_renders = max(generation_backlog, queued_trigger_count, pending_live_media, inflight_count)
+        return {
+            "session_id": self._pc_id,
+            "tag": self._tag,
+            "running": self._running,
+            "connection_kind": "unknown",
+            "output_transport": self._output_transport,
+            "pipeline_status": self._pipeline_status,
+            "pipeline_renderer": self._pipeline_renderer,
+            "pipeline_model": self._pipeline_model,
+            "pipeline_error": self._pipeline_error,
+            "pipeline_fps": float(self._pipeline_fps),
+            "compile_status": dict(self._pipeline_compile_status),
+            "build_phase": self._session_manager.build_phase,
+            "build_progress": float(self._session_manager.build_progress),
+            "build_message": self._session_manager.build_message,
+            "generation_backlog": generation_backlog,
+            "input_generation": int(self._input_generation),
+            "last_completed_generation": int(self._last_completed_generation),
+            "pending_renders": pending_renders,
+            "queued_scene_id": self._queued_scene_id,
+            "queued_at": self._queued_at_iso,
+            "pending_live_media_revision": int(self._pending_live_media_revision),
+            "media_tracks": len(self._media_frames),
+            "output_subscribers": len(self._output_media_queues),
+            "scene_resources": len(self._scene_resources),
+            "signal_count": len(self._scene_struct.get("signals") or []),
+            "render_dispatch_count": int(self._render_dispatch_count),
+            "render_success_count": int(self._render_success_count),
+            "render_stale_count": int(self._render_stale_count),
+            "render_skip_count": int(self._render_skip_count),
+            "render_error_count": int(self._error_count),
+            "inference_active": inference_active,
+            "active_inference_generation": int(self._active_inference_generation),
+            "active_for_ms": active_for_ms,
+            "last_queue_wait_ms": float(self._last_queue_wait_ms),
+            "last_latency_ms": float(self._last_latency_ms),
+            "last_end_to_end_ms": float(self._last_end_to_end_ms),
+            "step_info": step_info,
+        }
 
     @property
     def output_frame_mime(self) -> str:
@@ -783,6 +908,9 @@ class InpaintSession:
         _merge_dict(next_scene, patch)
         next_scene.pop("id", None)
         if next_scene == self._scene_struct:
+            # Patch produced no net change. Acknowledge immediately so the frontend
+            # is not left waiting for an input_ready that would never arrive.
+            self._notify_input_ready(self._last_scene_id or "", self._input_generation, "nochange")
             return
         previous_scene = self._scene_struct
         self._scene_struct = next_scene
@@ -794,11 +922,22 @@ class InpaintSession:
                 # Keep latest scene state but let media-frame arrivals drive cadence.
                 self._pending_live_media_revision = max(self._pending_live_media_revision, live_input_revision)
                 self._stamp_render_trigger()
+                self._input_event.set()
                 return
             if live_input_revision > previous_input_revision:
                 if self._scene_without_live_input_revision(previous_scene) == self._scene_without_live_input_revision(next_scene):
-                    # Drawing revision pulses should be driven by incoming video/media frames.
-                    self._stamp_render_trigger()
+                    pending_revision = self._should_wait_for_live_media(patch)
+                    if pending_revision:
+                        self._pending_live_media_revision = max(self._pending_live_media_revision, pending_revision)
+                        logger.info(
+                            "RTC[%s] deferring live input revision %d until next media frame",
+                            self._tag,
+                            pending_revision,
+                        )
+                        return
+                    # The latest primary media frame is already available, so this
+                    # input revision is immediately renderable.
+                    self._mark_staging_changed(semantic_reset=False)
                     return
             pending_revision = self._should_wait_for_live_media(patch) if live_input_revision > previous_input_revision else 0
             if pending_revision:
@@ -832,6 +971,9 @@ class InpaintSession:
                 _apply_scene_event(next_scene, event)
         next_scene.pop("id", None)
         if next_scene == self._scene_struct:
+            # Events produced no net change. Acknowledge immediately so the frontend
+            # is not left waiting for an input_ready that would never arrive.
+            self._notify_input_ready(self._last_scene_id or "", self._input_generation, "nochange")
             return
         previous_scene = self._scene_struct
         self._scene_struct = next_scene
@@ -844,11 +986,22 @@ class InpaintSession:
                 # Keep latest scene state but let media-frame arrivals drive cadence.
                 self._pending_live_media_revision = max(self._pending_live_media_revision, live_input_revision)
                 self._stamp_render_trigger()
+                self._input_event.set()
                 return
             if live_input_revision > previous_input_revision:
                 if self._scene_without_live_input_revision(previous_scene) == self._scene_without_live_input_revision(next_scene):
-                    # Drawing revision pulses should be driven by incoming video/media frames.
-                    self._stamp_render_trigger()
+                    pending_revision = self._should_wait_for_live_media(patch_for_revision)
+                    if pending_revision:
+                        self._pending_live_media_revision = max(self._pending_live_media_revision, pending_revision)
+                        logger.info(
+                            "RTC[%s] deferring live input revision %d until next media frame",
+                            self._tag,
+                            pending_revision,
+                        )
+                        return
+                    # The latest primary media frame is already available, so this
+                    # input revision is immediately renderable.
+                    self._mark_staging_changed(semantic_reset=False)
                     return
             pending_revision = self._should_wait_for_live_media(patch_for_revision) if live_input_revision > previous_input_revision else 0
             if pending_revision:
@@ -887,9 +1040,21 @@ class InpaintSession:
         return raw
 
     def _is_primary_media_track(self, track_id: str) -> bool:
-        channel = self._normalize_media_channel(self._media_channels.get(track_id, "color"))
+        channel = self._normalize_media_channel(self._media_channels.get(track_id, ""))
         layer_id = self._media_layer_ids.get(track_id, "")
-        return channel in {"canvas", "input", "frame", "color"} and not layer_id
+        if layer_id:
+            return False
+        if channel in {"canvas", "input", "frame"}:
+            return True
+        # Backward-compat fallback for older clients that did not set channel.
+        label = str(self._media_debug_names.get(track_id, "")).lower()
+        if "input/frame" in label or "input:canvas" in label:
+            return True
+        # Some clients attach the inbound canvas track before the separate
+        # `media_track` metadata message lands, leaving the track unlabeled.
+        # Treat top-level color/unknown tracks as primary input so live-draw
+        # revisions can still consume the freshest media frame.
+        return channel in {"", "color"}
 
     @staticmethod
     def _scene_without_live_input_revision(scene: dict[str, Any]) -> dict[str, Any]:
@@ -903,7 +1068,12 @@ class InpaintSession:
         key = str(track_id or "").strip()
         if not key:
             return
-        self._media_frames[key] = image.convert("RGB")
+        is_primary_track = self._is_primary_media_track(key)
+        next_image = _neutral_rgb(image)
+        previous_image = self._media_frames.get(key)
+        if is_primary_track and _images_equal(previous_image, next_image):
+            return
+        self._media_frames[key] = next_image
         self._media_frame_seq += 1
         self._media_frame_versions[key] = self._media_frame_seq
         if self._pending_live_media_revision:
@@ -914,6 +1084,8 @@ class InpaintSession:
                 self._input_event.set()
             else:
                 self._mark_staging_changed(semantic_reset=False)
+            return
+        if is_primary_track and not bool(self._settings.get("stream_diffusion")):
             return
         # Wake the render loop, but let it coalesce multiple incoming frames into
         # a single render pass using the freshest available frame set.
@@ -973,6 +1145,8 @@ class InpaintSession:
         logger.info("RTC[%s] process loop started", self._tag)
         _last_generation = -1
         _last_published_input_generation = -1
+        _last_stream_state_key: tuple[int, int] | None = None
+        _stream_state_pass_count = 0
         while self._running:
             await self._input_event.wait()
             self._input_event.clear()
@@ -987,6 +1161,7 @@ class InpaintSession:
                 media_frame_seq = self._media_frame_seq
                 input_generation = self._input_generation
                 stream_mode = bool(self._settings.get("stream_diffusion"))
+                stream_max_passes = max(1, int(self._settings.get("stream_max_passes") or 16))
                 if self._input_generation == _last_published_input_generation and media_frame_seq == self._last_rendered_media_frame_seq and not stream_mode:
                     continue
                 canvas_url = self._canvas_url or ""
@@ -1000,6 +1175,10 @@ class InpaintSession:
                 queued_at_iso = self._queued_at_iso
                 queue_wait_ms = max(0.0, (time.perf_counter() - self._queued_at_perf) * 1000.0) if self._queued_at_perf > 0 else 0.0
                 render_start_at = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+                self._render_dispatch_count += 1
+                self._active_inference_started_perf = time.perf_counter()
+                self._active_inference_generation = input_generation
+                self._last_queue_wait_ms = queue_wait_ms
                 logger.info(
                     "RTC[%s] dispatching queued scene: scene_id=%s gen=%d queued_at=%s render_start_at=%s",
                     self._tag,
@@ -1023,6 +1202,8 @@ class InpaintSession:
                         timings["server_end_to_end_ms"] = round(queue_wait_ms + server_total, 3)
                         timings["queued_at"] = queued_at_iso
                         timings["render_started_at"] = render_start_at
+                        self._last_end_to_end_ms = float(timings.get("server_end_to_end_ms") or 0.0)
+                        self._last_latency_ms = float(frame_meta.get("latency_ms") or 0.0) if isinstance(frame_meta, dict) else 0.0
                     if self._input_generation != input_generation:
                         rendered_input_revision = self._settings_revision(settings, "input_revision")
                         logger.info(
@@ -1043,6 +1224,8 @@ class InpaintSession:
                         self._notify_input_ready(self._queued_scene_id, self._input_generation, "stale_preview")
                         self._notify_status()
                         self._last_rendered_media_frame_seq = input_media_seq
+                        self._render_stale_count += 1
+                        self._last_completed_generation = max(self._last_completed_generation, input_generation)
                         self._input_event.set()
                         _last_published_input_generation = -1
                         continue
@@ -1061,7 +1244,21 @@ class InpaintSession:
                     self._notify_status()
                     self._last_rendered_media_frame_seq = input_media_seq
                     _last_published_input_generation = input_generation
+                    self._render_success_count += 1
+                    self._last_completed_generation = max(self._last_completed_generation, input_generation)
                     self._error_count = 0
+                    if stream_mode:
+                        stream_state_key = (input_generation, input_media_seq)
+                        if _last_stream_state_key == stream_state_key:
+                            _stream_state_pass_count += 1
+                        else:
+                            _last_stream_state_key = stream_state_key
+                            _stream_state_pass_count = 1
+                        if self._running and self._input_generation == input_generation and self._media_frame_seq == input_media_seq and _stream_state_pass_count < stream_max_passes:
+                            self._input_event.set()
+                    else:
+                        _last_stream_state_key = None
+                        _stream_state_pass_count = 0
                 else:
                     # ``result is None`` means either:
                     #   (a) the pipeline session is still loading (build phase)
@@ -1071,6 +1268,8 @@ class InpaintSession:
                     self._notify_render_done(queued_scene_id, input_generation, "skipped")
                     self._notify_status()
                     self._last_rendered_media_frame_seq = input_media_seq
+                    self._render_skip_count += 1
+                    self._last_completed_generation = max(self._last_completed_generation, input_generation)
                     if self._running and self._input_generation == input_generation:
                         self._input_event.set()
             except Exception as _exc:
@@ -1081,7 +1280,11 @@ class InpaintSession:
                 self._notify_render_done(self._queued_scene_id, self._input_generation, "error")
                 self._notify_input_ready(self._queued_scene_id, self._input_generation, "error")
                 self._notify_status()
+                self._last_completed_generation = max(self._last_completed_generation, self._input_generation)
                 _last_published_input_generation = self._input_generation
+            finally:
+                self._active_inference_started_perf = 0.0
+                self._active_inference_generation = 0
 
     def _notify_render_done(self, scene_id: str, generation: int, status: str) -> None:
         try:
@@ -1109,6 +1312,7 @@ class InpaintSession:
         compile_items = tuple(sorted((str(k), str(v)) for k, v in self._pipeline_compile_status.items()))
         signature = (
             self._pipeline_status,
+            self._pipeline_renderer,
             self._pipeline_model,
             round(float(self._pipeline_fps), 3),
             self._pipeline_error,
@@ -1123,6 +1327,7 @@ class InpaintSession:
         payload: dict[str, object] = {
             "__event__": "status",
             "phase": self._pipeline_status,
+            "renderer": self._pipeline_renderer,
             "model": self._pipeline_model,
             "fps": self._pipeline_fps,
             "error": self._pipeline_error,
@@ -1155,6 +1360,19 @@ class InpaintSession:
             "wrapper": type(unet).__name__ if unet is not None else "",
             "original": type(original).__name__ if original is not None else "",
         }
+
+    @staticmethod
+    def _renderer_name(mode: str, use_stream_diffusion: bool, model_path: str) -> str:
+        if use_stream_diffusion:
+            return "streamdiffusion"
+        normalized = f"{mode} {model_path}".replace("\\", "/").lower()
+        if "z-image" in normalized or "zimage" in normalized:
+            return "zimage"
+        if "xl" in normalized or "sdxl" in normalized:
+            return "sdxl"
+        if "sd/" in normalized or "stable-diffusion" in normalized or "inpaint" in normalized:
+            return "sd"
+        return "diffusion"
 
     def _decode_layer_frames(self, layer_frames_url: dict[str, str], w: int, h: int) -> dict[str, Image.Image]:
         """Decode layer frame data URLs, using cache to avoid redundant work."""
@@ -1290,7 +1508,7 @@ class InpaintSession:
                 current = masks.get(lid)
                 masks[lid] = alpha if current is None else ImageChops.lighter(current, alpha)
                 if lid not in images:
-                    images[lid] = rgba.convert("RGB")
+                    images[lid] = _neutral_rgb(rgba)
             except Exception:
                 continue
         return masks, images
@@ -1344,13 +1562,17 @@ class InpaintSession:
         if canvas_url:
             if canvas_url != self._cached_canvas_url:
                 try:
-                    self._cached_canvas_img = _neutral_rgb(Image.open(io.BytesIO(_decode_data_url(canvas_url))))
+                    decoded_canvas = Image.open(io.BytesIO(_decode_data_url(canvas_url)))
+                    self._cached_canvas_img = _neutral_rgb(decoded_canvas)
+                    self._cached_canvas_empty_mask = _empty_alpha_as_denoise_mask(decoded_canvas)
                 except Exception:
                     self._cached_canvas_img = Image.new("RGB", (w, h), (128, 128, 128))
+                    self._cached_canvas_empty_mask = None
                 self._cached_canvas_url = canvas_url
             canvas = self._cached_canvas_img if self._cached_canvas_img is not None else Image.new("RGB", (w, h), (128, 128, 128))
         else:
             canvas = Image.new("RGB", (w, h), (128, 128, 128))
+            self._cached_canvas_empty_mask = None
         mark_timing("canvas_decode_ms", stage_started)
 
         stage_started = time.perf_counter()
@@ -1360,7 +1582,19 @@ class InpaintSession:
                 primary_media_candidates.append((self._media_frame_versions.get(track_id, 0), track_id, media_img))
         if primary_media_candidates:
             version, _track_id, media_img = max(primary_media_candidates, key=lambda item: item[0])
-            canvas = media_img.resize((w, h), Image.BILINEAR) if media_img.size != (w, h) else media_img
+            media_canvas = media_img.resize((w, h), Image.BILINEAR) if media_img.size != (w, h) else media_img
+            # Media frames from canvas tracks can arrive as RGB without alpha,
+            # which turns fully transparent regions into black pixels.
+            # Keep the latest media on opaque pixels only, and preserve the
+            # neutralized canvas for transparent zones.
+            if self._cached_canvas_empty_mask is not None:
+                empty_mask = self._cached_canvas_empty_mask
+                if empty_mask.size != (w, h):
+                    empty_mask = empty_mask.resize((w, h), Image.NEAREST)
+                opaque_mask = ImageChops.invert(empty_mask)
+                canvas = Image.composite(media_canvas, canvas, opaque_mask)
+            else:
+                canvas = media_canvas
             if version > self._last_consumed_primary_media_version:
                 self._last_consumed_primary_media_version = version
         mark_timing("primary_input_select_ms", stage_started)
@@ -1391,6 +1625,11 @@ class InpaintSession:
                 self._cached_mask = None
             self._cached_mask_url = mask_url
         mask = self._cached_mask
+        if self._cached_canvas_empty_mask is not None:
+            canvas_empty_mask = self._cached_canvas_empty_mask
+            if canvas_empty_mask.size != (w, h):
+                canvas_empty_mask = canvas_empty_mask.resize((w, h), Image.NEAREST)
+            mask = canvas_empty_mask if mask is None else ImageChops.lighter(mask, canvas_empty_mask)
         mark_timing("mask_decode_ms", stage_started)
 
         # Decode layer frames (cached by URL)
@@ -1501,12 +1740,13 @@ class InpaintSession:
             resolved_mask = resolved.mask
             resolved_strength = resolved.strength
             resolved_denoise_map = resolved.denoise_map
+            resolved_mask_rgb = resolved.mask.convert("RGB")
+            resolved_denoise_rgb = resolved.denoise_map.convert("RGB")
             if debug_enabled:
-                if not signal_debug_enabled:
-                    debug_channels["condition_mask"] = resolved.mask.convert("RGB")
-                    debug_channels["condition_denoise"] = resolved.denoise_map.convert("RGB")
-                    debug_channels["input/mask/aggregated"] = resolved.mask.convert("RGB")
-                    debug_channels["input/mask/aggregated/denoise"] = resolved.denoise_map.convert("RGB")
+                debug_channels["condition_mask"] = resolved_mask_rgb
+                debug_channels["condition_denoise"] = resolved_denoise_rgb
+                debug_channels["input/mask/aggregated"] = resolved_mask_rgb
+                debug_channels["input/mask/aggregated/denoise"] = resolved_denoise_rgb
                 mark_timing("conditioning_resolve_ms", stage_started)
 
         # Composition plan: build a Scene from legacy layer_conditions then compose.
@@ -1522,24 +1762,39 @@ class InpaintSession:
         # alpha mask when a channel is missing. See LAYER_SYSTEM.md §3.
         stage_started = time.perf_counter()
         channel_masks = self._build_channel_masks_by_region(layer_conditions, w, h)
-        if debug_enabled and not signal_debug_enabled:
-            by_region: dict[str, dict[str, Any]] = {}
-            for c in layer_conditions:
-                layer_id = str(c.get("layer_id") or "")
-                region_id = str(c.get("region_id") or c.get("name") or "")
-                if region_id:
-                    by_region[region_id] = c
-                if layer_id and region_id:
-                    by_region[f"{layer_id}:{region_id}"] = c
-            for region_id, masks in channel_masks.items():
-                cond_info: dict[str, Any] = by_region.get(region_id) or {}
-                layer_id = str(cond_info.get("layer_id") or "layer")
-                label = _debug_label(cond_info.get("name") or region_id, region_id)
-                layer_label = _debug_label(layer_id, "layer")
-                for channel, mask_img in masks.items():
-                    debug_channels[f"input/mask/{layer_label}/{label}/{channel}"] = (
-                        _tinted_mask_preview(mask_img, cond_info.get("mask_color")) if channel == "color" else mask_img.convert("RGB")
-                    )
+        by_region: dict[str, dict[str, Any]] = {}
+        for c in layer_conditions:
+            layer_id = str(c.get("layer_id") or "")
+            region_id = str(c.get("region_id") or c.get("name") or "")
+            if region_id:
+                by_region[region_id] = c
+            if layer_id and region_id:
+                by_region[f"{layer_id}:{region_id}"] = c
+        for region_id, masks in channel_masks.items():
+            cond_info: dict[str, Any] = by_region.get(region_id) or {}
+            layer_id = str(cond_info.get("layer_id") or "layer")
+            label = _debug_label(cond_info.get("name") or region_id, region_id)
+            layer_label = _debug_label(layer_id, "layer")
+            for channel, mask_img in masks.items():
+                rendered = _tinted_mask_preview(mask_img, cond_info.get("mask_color")) if channel == "color" else mask_img.convert("RGB")
+                if debug_enabled:
+                    debug_channels[f"input/mask/{layer_label}/{label}/{channel}"] = rendered
+                if channel not in {"cfg", "color"}:
+                    debug_channels[f"final/{channel}/{layer_label}/{label}"] = rendered
+        color_by_region: dict[str, Image.Image] = {}
+        for cond in layer_conditions:
+            layer_id = str(cond.get("layer_id") or "")
+            region_id = str(cond.get("region_id") or cond.get("name") or "")
+            image_url = str(cond.get("image") or "")
+            if not layer_id or not region_id or not image_url:
+                continue
+            try:
+                rgba = Image.open(io.BytesIO(_decode_data_url(image_url))).convert("RGBA")
+                if rgba.size != (w, h):
+                    rgba = rgba.resize((w, h), Image.BILINEAR)
+                color_by_region[f"{layer_id}:{region_id}"] = rgba
+            except Exception:
+                continue
         scene = scene_from_legacy(
             layer_conditions,
             base_prompt=base_prompt,
@@ -1551,6 +1806,7 @@ class InpaintSession:
             masks_by_layer=layer_masks,
             prompt_overrides=overrides,
             channel_masks_by_region=channel_masks,
+            color_by_region=color_by_region,
         )
         # StreamDiffusion: multi_pass=True, per_region_schedule=False, per_region_cfg=False
         # (single CFG batch). regional_prompts works via the per-pass prompt_override.
@@ -1586,13 +1842,19 @@ class InpaintSession:
         # prompt passes. If we also send it as the base prompt, regional RGBA
         # prompts become global and can bleed outside their alpha/prompt masks.
         single_plan = compose(scene, RenderMode.SINGLE_PASS, stream_support)
+        if single_plan.single is not None:
+            debug_channels["final/rgba/aggregated"] = _compose_region_color_preview(scene, w, h)
+            debug_channels["final/denoise/aggregated"] = single_plan.single.denoise_map.convert("RGB")
+            debug_channels["final/cfg/aggregated"] = _cfg_factor_preview(single_plan.single.cfg_map)
         merged_prompt = single_plan.single.prompt if single_plan.single else base_prompt
+        composed_cfg = float(single_plan.single.cfg_scalar) if single_plan.single is not None else float(settings.get("cfg", 1.0))
         prompt_override = base_prompt if layer_regions else (merged_prompt if merged_prompt is not None else base_prompt)
         mark_timing("composition_plan_ms", stage_started)
 
         # Route to StreamDiffusion realtime session or Diffusers single-pass session.
         model_path = settings.get("model_path", "")
         use_stream_diffusion = bool(settings.get("stream_diffusion"))
+        self._pipeline_renderer = self._renderer_name("", use_stream_diffusion, str(model_path))
         self._pipeline_model = (model_path.split("/")[-1] or model_path.split("\\")[-1] or model_path)[:48]
         stream_reset_generation = int(settings.get("_stream_reset_generation", -1) or -1)
         is_new_stream_generation = (
@@ -1633,7 +1895,7 @@ class InpaintSession:
                 height=h,
                 steps=int(settings.get("steps") or 1),
                 strength=float(resolved_strength),
-                cfg=float(settings.get("cfg", 1.0)),
+                cfg=composed_cfg,
                 sampler=settings.get("sampler"),
                 scheduler=settings.get("scheduler"),
                 residual_cfg=bool(settings.get("residual_cfg")),
@@ -1683,6 +1945,7 @@ class InpaintSession:
             self._pipeline_status = "ready"
             self._pipeline_error = ""
             self._pipeline_fps = frame_result.fps
+            self._pipeline_renderer = self._renderer_name(frame_result.mode, False, str(model_path))
             debug_payload = dict(frame_result.raw_debug_urls or {})
             stage_started = time.perf_counter()
             output_bytes = self._encode_output_bytes(img)
@@ -1697,8 +1960,15 @@ class InpaintSession:
                 output_path.write_bytes(output_bytes)
             persist_ms = mark_timing("output_persist_ms", stage_started)
             debug_persist_ms = 0.0
+            # Always emit output + final/ channels so the signal picker works
+            # regardless of whether the full debug overlay is enabled.
+            debug_channels["output"] = img
+            _signal_keys: set[str] = {"output"} | {k for k in debug_channels if k.startswith("final/")}
+            debug_payload.update(_encode_debug_channels(
+                {k: v for k, v in debug_channels.items() if k in _signal_keys},
+                include_images=True, always_include=_signal_keys,
+            ))
             if debug_enabled:
-                debug_channels["output"] = img
                 debug_payload.update(_encode_debug_channels(debug_channels, include_images=True, always_include={"output"}))
                 stage_started = time.perf_counter()
                 for name, debug_image in debug_channels.items():
@@ -1734,6 +2004,7 @@ class InpaintSession:
 
         self._pipeline_status = "ready"
         self._pipeline_error = ""
+        self._pipeline_renderer = self._renderer_name("streamdiffusion", True, str(model_path))
         self._pipeline_compile_status = self._pipe_compile_status(
             self._session_manager._pipe,
             bool(settings.get("stream_triton_compile", True)),
@@ -1813,7 +2084,7 @@ class InpaintSession:
             width=w,
             height=h,
             prompt=PromptBundle(lerp_b=float(settings.get("prompt_lerp", 0.0))),
-            sampler=SamplerSpec(),
+            sampler=SamplerSpec(cfg=composed_cfg),
             cond=cond_inputs,
             backend_hints={
                 "mask": resolved_mask,
@@ -1846,8 +2117,8 @@ class InpaintSession:
         mark_timing("inference_ms", stage_started)
         img = frame_result.image
 
-        if debug_enabled:
-            debug_channels["output"] = img
+        # Always emit output for the signal picker; debug_enabled also uses it.
+        debug_channels["output"] = img
 
         self._pipeline_fps = 1000.0 / frame_result.latency_ms if frame_result.latency_ms > 0 else 0.0
 
@@ -1867,6 +2138,13 @@ class InpaintSession:
             output_path.write_bytes(output_bytes)
         persist_ms = mark_timing("output_persist_ms", stage_started)
         debug_persist_ms = 0.0
+        # Always emit output + final/ channels so the signal picker works
+        # regardless of whether the full debug overlay is enabled.
+        _signal_keys: set[str] = {"output"} | {k for k in debug_channels if k.startswith("final/")}
+        debug_payload.update(_encode_debug_channels(
+            {k: v for k, v in debug_channels.items() if k in _signal_keys},
+            include_images=True, always_include=_signal_keys,
+        ))
         if debug_enabled:
             self._debug_frame_count += 1
             encode_images = (self._debug_frame_count % 3 == 0)

@@ -16,6 +16,7 @@ from starlette.exceptions import HTTPException
 
 from .api import assets, inpaint, layer, sources, system
 from .api.state import on_stream_session_build
+from .console_dashboard import dashboard_enabled, start_console_dashboard, stop_console_dashboard
 from .config import load_local_env
 from .rtc import router as rtc_router, _shared_session_manager as _stream_session_manager
 
@@ -23,10 +24,14 @@ load_local_env()
 
 # ── Logging ────────────────────────────────────────────────────────
 
+_dashboard_active = dashboard_enabled()
 logging.basicConfig(
-    level=os.getenv("RTD_LOG_LEVEL", "INFO").upper(),
+    level=os.getenv("RTD_LOG_LEVEL", "WARNING" if _dashboard_active else "INFO").upper(),
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
 )
+if _dashboard_active:
+    logging.getLogger("rtdiffusion").setLevel(logging.WARNING)
+    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 
 # ── Windows: suppress harmless WinError 10054 in asyncio SSE cleanup ──
 # When a browser closes an SSE connection, asyncio tries sock.shutdown(SHUT_RDWR)
@@ -52,6 +57,16 @@ _stream_session_manager.set_status_callback(on_stream_session_build)
 # ── App ────────────────────────────────────────────────────────────
 
 app = FastAPI(title="RTDiffusion")
+
+
+@app.on_event("startup")
+async def _start_runtime_dashboard() -> None:
+    start_console_dashboard()
+
+
+@app.on_event("shutdown")
+async def _stop_runtime_dashboard() -> None:
+    stop_console_dashboard()
 
 app.add_middleware(
     CORSMiddleware,

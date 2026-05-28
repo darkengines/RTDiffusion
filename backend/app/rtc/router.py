@@ -401,26 +401,37 @@ async def rtc_offer(request: Request):
         pc_id = requested_session
         session.set_output_transport(output_transport)
 
-    pc = _peer_connections.get(pc_id)
-    if pc is None:
-        pc = RTCPeerConnection()
-        _peer_connections[pc_id] = pc
-
-    if output_transport == "image" and getattr(pc, "_rtd_output_track_attached", False):
-        output_track = getattr(pc, "_rtd_output_track", None)
-        if output_track is not None:
+    # Always rebuild the PeerConnection for each SDP offer. Reusing a previous
+    # pc_id-level connection can leave stale transceivers behind, which then
+    # mismatches new offers (e.g. image transport with no RTP m-lines) and
+    # triggers aiortc mline index errors.
+    prev_pc = _peer_connections.pop(pc_id, None)
+    if prev_pc is not None:
+        prev_track = getattr(prev_pc, "_rtd_output_track", None)
+        if prev_track is not None:
             try:
-                output_track.stop()
+                prev_track.stop()
             except Exception:
-                logger.debug("RTC[%s] failed to stop output track during image transport switch", pc_id[:8], exc_info=True)
-        setattr(pc, "_rtd_output_track", None)
-        setattr(pc, "_rtd_output_track_attached", False)
+                logger.debug("RTC[%s] failed to stop previous output track", pc_id[:8], exc_info=True)
+        prev_tasks = _peer_media_tasks.pop(pc_id, set())
+        for task in prev_tasks:
+            task.cancel()
+        try:
+            await prev_pc.close()
+        except Exception:
+            logger.debug("RTC[%s] failed to close previous peer connection", pc_id[:8], exc_info=True)
 
-    if output_transport == "video" and not getattr(pc, "_rtd_output_track_attached", False):
+    pc = RTCPeerConnection()
+    _peer_connections[pc_id] = pc
+
+    if output_transport == "video":
         output_track = _SessionOutputVideoTrack(session)
         pc.addTrack(output_track)
         setattr(pc, "_rtd_output_track", output_track)
         setattr(pc, "_rtd_output_track_attached", True)
+    else:
+        setattr(pc, "_rtd_output_track", None)
+        setattr(pc, "_rtd_output_track_attached", False)
 
     if not getattr(pc, "_rtd_handlers_attached", False):
         setattr(pc, "_rtd_handlers_attached", True)

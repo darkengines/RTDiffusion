@@ -124,6 +124,7 @@ class InpaintFrame(BaseModel):
     stream_direct: bool = False
     stream_timestep_indices: list[int] = Field(default_factory=lambda: [0, 16, 32, 45], max_length=16)
     stream_frame_buffer_size: int = Field(default=1, ge=1, le=4)
+    stream_max_passes: int = Field(default=16, ge=1, le=512)
     stream_cfg_type: str = Field(default="self", max_length=16)
     stream_triton_compile: bool = False
     # When set (0..1), overrides stream_timestep_indices via an auto-picker:
@@ -142,6 +143,15 @@ class InpaintFrame(BaseModel):
     tile_divisions: int = Field(default=2, ge=1, le=8)
     tile_overlap: int = Field(default=128, ge=0, le=512)
     layer_bbox_padding: int = Field(default=64, ge=0, le=256)
+
+    def allows_scene_result_reuse(self) -> bool:
+        """Whether transports may replay a cached scene result for this frame.
+
+        This is part of the transport-facing contract rather than a pipeline-
+        specific detail. Debug streams require a fresh backend result so image
+        channels are regenerated consistently across renderers.
+        """
+        return (not self.stream_diffusion) and (not self.debug_streams) and bool(self.scene_id)
 
 
 class InpaintResult(BaseModel):

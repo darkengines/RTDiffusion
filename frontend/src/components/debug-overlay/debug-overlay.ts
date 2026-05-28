@@ -8,16 +8,29 @@ import '../debug-surface/debug-surface'
 @customElement('rtd-debug-overlay')
 export class RtdDebugOverlay extends LitElement {
   private _stream = new StoreController(this, $stream)
+  private _requestOverlayUpdate = () => { this.requestUpdate() }
+
+  connectedCallback() {
+    super.connectedCallback()
+    window.addEventListener('rtd:debug-surfaces-update', this._requestOverlayUpdate)
+    window.addEventListener('rtd:debug-update', this._requestOverlayUpdate as EventListener)
+  }
+
+  disconnectedCallback() {
+    window.removeEventListener('rtd:debug-surfaces-update', this._requestOverlayUpdate)
+    window.removeEventListener('rtd:debug-update', this._requestOverlayUpdate as EventListener)
+    super.disconnectedCallback()
+  }
 
   static styles = css`
-    :host { display: block; width: 100%; height: 100% }
-    .debug-overlay { display: flex; flex-direction: column; width: 100%; height: 100%; background: #111; color: #eee; overflow: hidden }
+    :host { display: block; width: 100%; height: 100%; min-height: 0 }
+    .debug-overlay { display: flex; flex-direction: column; width: 100%; height: 100%; min-height: 0; background: #111; color: #eee; overflow: hidden }
     .debug-overlay-empty { justify-content: center; align-items: center; font-size: 13px; color: #666 }
     .debug-overlay-toolbar { display: flex; gap: 8px; align-items: center; padding: 6px 10px; background: #1a1a1a; border-bottom: 1px solid #333; font-size: 12px; flex-shrink: 0 }
     .debug-overlay-toolbar button { background: #333; border: none; color: #eee; padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 11px }
     .debug-overlay-toolbar button:hover { background: #444 }
     .debug-channel-label { font-weight: 600; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
-    .debug-mosaic-grid { flex: 1; overflow-y: auto; display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 4px; padding: 4px }
+    .debug-mosaic-grid { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 4px; padding: 4px }
     .debug-mosaic-cell { position: relative; background: #000; border-radius: 4px; overflow: hidden; cursor: pointer; aspect-ratio: 16/9 }
     .debug-mosaic-cell:hover { outline: 1px solid var(--accent, #5f6fff) }
     .debug-mosaic-cell rtd-debug-surface { width: 100%; height: 100%; display: block }
@@ -28,7 +41,7 @@ export class RtdDebugOverlay extends LitElement {
     .debug-tag-empty { color: #555; font-size: 10px; padding: 4px }
     .debug-preview-wrapper { flex: 1; overflow: hidden; display: flex; align-items: center; justify-content: center; background: #000 }
     .debug-preview-full { width: 100%; height: 100% }
-    .debug-preview-text { flex: 1; overflow-y: auto; padding: 8px; display: flex; flex-wrap: wrap; gap: 4px; align-content: flex-start }
+    .debug-preview-text { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 8px; display: flex; flex-wrap: wrap; gap: 4px; align-content: flex-start }
   `
 
   render() {
