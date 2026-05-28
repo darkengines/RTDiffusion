@@ -1,19 +1,7 @@
-"""Scene composition.
+"""Transport-boundary helpers.
 
-The composer turns the editor's layer list into the inputs a sampler wants:
-one color image, one denoise map, a CN-input per ControlNet id, and a
-prompt bundle. Every transport path runs through this single composer.
+The legacy scene composer (SceneComposer / layer_conditions_to_layers /
+Layer / AutoTagSpec) has been removed; the v2 wire format aggregates on
+the frontend, see :mod:`app.render_plan`. Only :mod:`compose.io` (mask
+polarity / data-URL helpers) survives because transports still need it.
 """
-
-from .composer import ComposedScene, SceneComposer
-from .layer import AutoTagSpec, Layer
-from .legacy import layer_condition_to_layer, layer_conditions_to_layers
-
-__all__ = [
-    "AutoTagSpec",
-    "ComposedScene",
-    "Layer",
-    "SceneComposer",
-    "layer_condition_to_layer",
-    "layer_conditions_to_layers",
-]

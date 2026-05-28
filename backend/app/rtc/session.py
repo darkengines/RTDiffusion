@@ -17,13 +17,8 @@ from PIL import Image, ImageChops
 from ..stream import SessionManager as _SessionManager
 from ..stream.helpers import _TRITON_OK as _STREAM_TRITON_OK
 from ..pipeline_graph import SessionGraph, GraphResult, resolve_conditioning_mask
-from ..composition import (
-    CFG_HI,
-    RenderMode,
-    RendererSupport,
-    compose,
-    scene_from_legacy,
-)
+from ..composition import CFG_HI
+from ..render_plan import plan_from_wire
 from ..session_paths import ensure_session_layout, session_debug_path, session_output_path
 from ..inference import (
     CondInput,
@@ -1795,59 +1790,50 @@ class InpaintSession:
                 color_by_region[f"{layer_id}:{region_id}"] = rgba
             except Exception:
                 continue
-        scene = scene_from_legacy(
-            layer_conditions,
-            base_prompt=base_prompt,
-            base_negative_prompt=base_neg,
-            base_denoise=base_denoise,
-            base_cfg=float(settings.get("cfg", 1.0)),
-            width=w,
-            height=h,
-            masks_by_layer=layer_masks,
-            prompt_overrides=overrides,
-            channel_masks_by_region=channel_masks,
-            color_by_region=color_by_region,
-        )
-        # StreamDiffusion: multi_pass=True, per_region_schedule=False, per_region_cfg=False
-        # (single CFG batch). regional_prompts works via the per-pass prompt_override.
-        stream_support = RendererSupport(
-            regional_prompts=True,
-            per_region_cfg=False,
-            per_region_schedule=False,
-            spatial_denoise=True,
-            multi_pass=True,
-        )
-        layered_plan = compose(scene, RenderMode.LAYERED_PASS, stream_support)
-        # Convert PassSpec list to the dict format StreamInferenceSession.step() expects.
+        # v2 composition: prefer the new wire format (rgba_b64 / cfg_map_b64 /
+        # denoise_map_b64 / prompts[] / base_*) when present. The frontend
+        # aggregates the layer stack and sends finals; we just decode + flatten
+        # prompts into the legacy ``layer_regions`` shape the engine expects.
+        # During the v1 -> v2 transition the old layer_conditions are still
+        # decoded upstream for ControlNet / layer-frame / tagger plumbing,
+        # but spatial aggregation now happens client-side.
         layer_regions: list[dict[str, Any]] = []
-        if layered_plan.layered is not None:
-            for pass_spec in layered_plan.layered.passes:
-                denoise_value = max(0.0, min(0.999, float(pass_spec.denoise)))
-                region_denoise_map = pass_spec.denoise_mask.convert("L").point(
-                    lambda value, scale=denoise_value: int(round(value * scale))
-                )
+        merged_prompt = base_prompt
+        composed_cfg = float(settings.get("base_cfg") or settings.get("cfg") or 1.0)
+        if settings.get("rgba_b64") or settings.get("rgba_ref"):
+            blob_resolver = lambda ref: self.get_blob(ref)  # noqa: E731
+            plan = plan_from_wire(settings, blob_resolver=blob_resolver)
+            composed_cfg = float(plan.base_cfg) if plan.base_cfg else composed_cfg
+            for pi, p in enumerate(plan.prompts):
+                if not p.text:
+                    continue
+                mask_arr = p.mask
+                if mask_arr is not None:
+                    mask_img = Image.fromarray((mask_arr * 255.0).round().astype("uint8"), "L")
+                else:
+                    mask_img = Image.new("L", (w, h), 255)
+                # denoise_map for this region = aggregated denoise gated by mask.
+                den_arr = plan.denoise_map
+                if mask_arr is not None:
+                    den_arr = den_arr * mask_arr
+                den_img = Image.fromarray((den_arr * 255.0).round().astype("uint8"), "L")
                 layer_regions.append({
-                    "mask": pass_spec.mask,
-                    "denoise_map": region_denoise_map,
-                    "prompt": pass_spec.prompt,
-                    "denoise": pass_spec.denoise,
-                    "cfg": pass_spec.cfg,
-                    "layer_id": pass_spec.layer_id,
-                    "region_id": pass_spec.region_id,
+                    "mask": mask_img,
+                    "denoise_map": den_img,
+                    "prompt": p.text,
+                    "denoise": float(plan.base_denoise),
+                    "cfg": composed_cfg,
+                    "layer_id": f"v2:{pi}",
+                    "region_id": str(pi),
                 })
-        for msg in layered_plan.warnings.messages:
-            logger.warning("RTC[%s] composition: %s", self._tag, msg)
-
-        # Single-pass merged prompt is only a fallback when there are no layered
-        # prompt passes. If we also send it as the base prompt, regional RGBA
-        # prompts become global and can bleed outside their alpha/prompt masks.
-        single_plan = compose(scene, RenderMode.SINGLE_PASS, stream_support)
-        if single_plan.single is not None:
-            debug_channels["final/rgba/aggregated"] = _compose_region_color_preview(scene, w, h)
-            debug_channels["final/denoise/aggregated"] = single_plan.single.denoise_map.convert("RGB")
-            debug_channels["final/cfg/aggregated"] = _cfg_factor_preview(single_plan.single.cfg_map)
-        merged_prompt = single_plan.single.prompt if single_plan.single else base_prompt
-        composed_cfg = float(single_plan.single.cfg_scalar) if single_plan.single is not None else float(settings.get("cfg", 1.0))
+            if debug_enabled:
+                debug_channels["final/rgba/aggregated"] = Image.fromarray(plan.rgba, "RGBA").convert("RGB")
+                debug_channels["final/denoise/aggregated"] = Image.fromarray(
+                    (plan.denoise_map * 255.0).round().astype("uint8"), "L"
+                ).convert("RGB")
+                debug_channels["final/cfg/aggregated"] = Image.fromarray(
+                    (plan.cfg_map / CFG_HI * 255.0).round().clip(0, 255).astype("uint8"), "L"
+                ).convert("RGB")
         prompt_override = base_prompt if layer_regions else (merged_prompt if merged_prompt is not None else base_prompt)
         mark_timing("composition_plan_ms", stage_started)
 
