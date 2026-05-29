@@ -1800,6 +1800,7 @@ class InpaintSession:
         layer_regions: list[dict[str, Any]] = []
         merged_prompt = base_prompt
         composed_cfg = float(settings.get("base_cfg") or settings.get("cfg") or 1.0)
+        v2_prompts_text: list[str] = []
         if settings.get("rgba_b64") or settings.get("rgba_ref"):
             blob_resolver = lambda ref: self.get_blob(ref)  # noqa: E731
             plan = plan_from_wire(settings, blob_resolver=blob_resolver)
@@ -1807,6 +1808,7 @@ class InpaintSession:
             for pi, p in enumerate(plan.prompts):
                 if not p.text:
                     continue
+                v2_prompts_text.append(p.text)
                 mask_arr = p.mask
                 if mask_arr is not None:
                     mask_img = Image.fromarray((mask_arr * 255.0).round().astype("uint8"), "L")
@@ -1834,7 +1836,17 @@ class InpaintSession:
                 debug_channels["final/cfg/aggregated"] = Image.fromarray(
                     (plan.cfg_map / CFG_HI * 255.0).round().clip(0, 255).astype("uint8"), "L"
                 ).convert("RGB")
-        prompt_override = base_prompt if layer_regions else (merged_prompt if merged_prompt is not None else base_prompt)
+        # Build the merged prompt for the base pass when there are regional
+        # prompts. The base pass is what denoises pixels OUTSIDE any region
+        # (lower layers, background) -- if base_prompt is empty AND there are
+        # regional prompts, the base pass would be skipped by
+        # ``stream_session.py`` (gated on ``base_prompt_signature.strip()``)
+        # and lower layers would never see any denoise. Merging with the
+        # layer prompts ensures the base pass always runs while still letting
+        # the regional passes refine each prompt's painted region on top.
+        if layer_regions and not base_prompt.strip() and v2_prompts_text:
+            merged_prompt = ", ".join(v2_prompts_text)
+        prompt_override = merged_prompt if merged_prompt is not None else base_prompt
         mark_timing("composition_plan_ms", stage_started)
 
         # Route to StreamDiffusion realtime session or Diffusers single-pass session.
