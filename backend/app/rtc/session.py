@@ -1142,6 +1142,17 @@ class InpaintSession:
         _last_published_input_generation = -1
         _last_stream_state_key: tuple[int, int] | None = None
         _stream_state_pass_count = 0
+        # Note on "keep engine hot" / staging: the existing flow already
+        # implements the user's requested discipline. ``_mark_staging_changed``
+        # (called from every ``apply_scene`` / ``apply_scene_patch`` /
+        # ``apply_frame``) sets ``_input_event`` so a new client edit during
+        # inference is immediately picked up on the next loop iteration with
+        # the LATEST snapshot. Additionally, lines below re-fire ``_input_event``
+        # up to ``stream_max_passes`` times against the same staged scene so
+        # the engine keeps running after the user pauses (refines the latent).
+        # No additional always-hot bypass is needed -- spinning the loop
+        # without that cap wastes GPU on stale state and would defeat the
+        # max-passes budget below.
         while self._running:
             await self._input_event.wait()
             self._input_event.clear()
