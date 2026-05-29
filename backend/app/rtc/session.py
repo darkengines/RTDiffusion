@@ -1828,13 +1828,25 @@ class InpaintSession:
                     "layer_id": f"v2:{pi}",
                     "region_id": str(pi),
                 })
-            if debug_enabled:
-                debug_channels["final/rgba/aggregated"] = Image.fromarray(plan.rgba, "RGBA").convert("RGB")
-                debug_channels["final/denoise/aggregated"] = Image.fromarray(
-                    (plan.denoise_map * 255.0).round().astype("uint8"), "L"
-                ).convert("RGB")
-                debug_channels["final/cfg/aggregated"] = Image.fromarray(
-                    (plan.cfg_map / CFG_HI * 255.0).round().clip(0, 255).astype("uint8"), "L"
+            # Final/* channels feed the always-emit "signals" picker (top-right
+            # output overlay menu) -- emit them unconditionally so the menu
+            # has entries even when the heavyweight ``debug_streams`` toggle
+            # is off. They are cheap (small PIL ops on already-decoded arrays).
+            debug_channels["final/rgba/aggregated"] = Image.fromarray(plan.rgba, "RGBA").convert("RGB")
+            debug_channels["final/denoise/aggregated"] = Image.fromarray(
+                (plan.denoise_map * 255.0).round().astype("uint8"), "L"
+            ).convert("RGB")
+            debug_channels["final/cfg/aggregated"] = Image.fromarray(
+                (plan.cfg_map / CFG_HI * 255.0).round().clip(0, 255).astype("uint8"), "L"
+            ).convert("RGB")
+            # Per-prompt attention masks: one channel per prompt that carries
+            # a painted mask. Lets the user inspect which area each prompt
+            # is gated to in the v2 path.
+            for pi, p in enumerate(plan.prompts):
+                if not p.text or p.mask is None:
+                    continue
+                debug_channels[f"final/prompt/v2/{pi}"] = Image.fromarray(
+                    (p.mask * 255.0).round().astype("uint8"), "L"
                 ).convert("RGB")
         # Build the merged prompt for the base pass when there are regional
         # prompts. The base pass is what denoises pixels OUTSIDE any region
