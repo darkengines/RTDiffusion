@@ -534,6 +534,16 @@ class InpaintSession:
             ref = cond.get("prompt_mask_ref_name") or cond.get("prompt_mask_ref")
             if pm_status == "missing" and ref:
                 pm_status = f"ref-unresolved({str(ref)[:8]})"
+            # Frontend-side tag attached by ``_patchLegacyPromptMasks``:
+            # tells us at a glance whether the frontend even attempted
+            # to inject a prompt_mask, and if not, why. Most useful when
+            # backend pm_status is "missing" -- the frontend tag
+            # disambiguates "no canvas under that layer id" (scope key
+            # mismatch) from "canvas was there but lift returned null"
+            # (paint polarity / wrong scope).
+            fe_dbg = cond.get("_v2_dbg")
+            if isinstance(fe_dbg, str) and fe_dbg:
+                pm_status = f"{pm_status} | {fe_dbg}"
             rows.append({
                 "kind": "v1",
                 "layer": label_layer,

@@ -370,23 +370,37 @@ export class RtdAppShell extends LitElement {
       // mask entirely. Same logic for cfg/denoise -- only honour an
       // existing field if it's already a data URL.
       const existing = typeof cond.prompt_mask === 'string' ? cond.prompt_mask : ''
-      if (existing.startsWith('data:')) { skippedHadDataUrl++; continue }
+      if (existing.startsWith('data:')) {
+        skippedHadDataUrl++
+        ;(cond as Record<string, unknown>)._v2_dbg = 'fe:had-data-url'
+        continue
+      }
       if (!cache.has(layerId)) {
         const canvas = editor.getLayerChannelMaskCanvas(layerId, 'prompt')
-        if (!canvas) { cache.set(layerId, { url: '', nz: -1 }); continue }
-        const mask = this._lift8BitMask(canvas, w, h)
-        if (!mask) { cache.set(layerId, { url: '', nz: 0 }); continue }
-        let nz = 0
-        for (let i = 0; i < mask.length; i++) if (mask[i] > 0) nz++
-        cache.set(layerId, { url: this._encodeMaskToDataUrl(mask, w, h), nz })
+        if (!canvas) { cache.set(layerId, { url: '', nz: -1 }); }
+        else {
+          const mask = this._lift8BitMask(canvas, w, h)
+          if (!mask) { cache.set(layerId, { url: '', nz: 0 }); }
+          else {
+            let nz = 0
+            for (let i = 0; i < mask.length; i++) if (mask[i] > 0) nz++
+            cache.set(layerId, { url: this._encodeMaskToDataUrl(mask, w, h), nz })
+          }
+        }
       }
-      const entry = cache.get(layerId)
-      if (!entry || !entry.url) {
-        if (entry?.nz === -1) skippedNoCanvas++
-        else skippedEmptyLift++
+      const entry = cache.get(layerId)!
+      if (!entry.url) {
+        if (entry.nz === -1) {
+          skippedNoCanvas++
+          ;(cond as Record<string, unknown>)._v2_dbg = 'fe:no-canvas'
+        } else {
+          skippedEmptyLift++
+          ;(cond as Record<string, unknown>)._v2_dbg = 'fe:empty-lift'
+        }
         continue
       }
       cond.prompt_mask = entry.url
+      ;(cond as Record<string, unknown>)._v2_dbg = `fe:patched(nz=${entry.nz})`
       // The WebRTC splitter extracts ``prompt_mask`` into a blob ref and
       // then DELETES the inline field. If a stale ``prompt_mask_ref_name``
       // was set in a previous frame (different mask shape), the splitter

@@ -73,7 +73,14 @@ class ConsoleDashboard:
             sys.stdout.write(frame.rstrip() + "\n")
             sys.stdout.flush()
             return
+        # Hard-truncate every line to terminal width so a long row (e.g.
+        # the v2 masks table with a long prompt) cannot wrap and overrun
+        # the next visual row. Without this, the wrapped tail sits on the
+        # next terminal row and the eraser misses it on the next refresh,
+        # producing the "broken layout" the user observed.
+        term_w = max(40, shutil.get_terminal_size((140, 40)).columns) - 1
         lines = frame.rstrip().splitlines() or [""]
+        lines = [(line[:term_w] if len(line) > term_w else line) for line in lines]
         sys.stdout.write("\x1b[?25l\x1b[H")
         for index, line in enumerate(lines):
             if index:
@@ -158,14 +165,18 @@ class ConsoleDashboard:
                 ])
         if not rows:
             return "(no v2 mask data yet -- render at least one frame)"
-        prompt_col = max(20, width - 90)
+        # Hard cap the prompt column so even a multi-paragraph prompt
+        # can't blow the row past the terminal width. The dashboard
+        # writer truncates lines anyway but a sane column width keeps the
+        # other columns visible.
+        prompt_col = min(40, max(20, width - 120))
         columns = [
             ("session", 8),
             ("layer", 22),
             ("region", 12),
             ("prompt", prompt_col),
             ("mask_nz", 8),
-            ("status", 18),
+            ("status", 22),
             ("cfg", 5),
             ("denoise", 7),
             ("base", 18),
