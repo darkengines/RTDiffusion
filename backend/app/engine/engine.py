@@ -2297,30 +2297,49 @@ class DiffusionEngine:
         negative_prompt: str | None,
         guidance_scale: float,
     ) -> RegionalAttentionSpec | None:
+        # Diagnostic: log why this returns None for each scene so it's
+        # easy to tell from the backend log whether the painted prompt
+        # mask made it to the SDXL regional CLIP path. Most common
+        # silent-skip reason in practice is ``guidance_scale <= 1.0``
+        # (turbo / fast-step models force cfg to 0 or 1 -> regional
+        # attention disabled across the board).
         if self.pipeline_family == "z-image":
             # Current regional-attention wrapper swaps UNet processors and can
             # force generic AttnProcessor variants that ignore Z-Image kwargs
             # like ``freqs_cis``. Until a Z-Image-specific adapter exists,
             # disable processor-level regional attention for this backend.
+            logger.info("regional-attn: skipped (z-image pipeline family)")
             return None
         if guidance_scale <= 1.0:
+            logger.info(
+                "regional-attn: skipped (cfg=%.2f <= 1.0; turbo/lcm models force this)",
+                guidance_scale,
+            )
             return None
         pipe = cast(Any, self.pipe)
         if pipe is None or not hasattr(pipe, "encode_prompt"):
             return None
+        skipped: list[tuple[str, str]] = []  # (label, reason) per condition
         regions: list[RegionalAttentionRegion] = []
         for condition in frame.layer_conditions:
+            label = (condition.name or condition.layer_id or "?")[:24]
             prompt_text = str(condition.prompt or "").strip()
             if not prompt_text:
+                skipped.append((label, "empty prompt"))
                 continue
             mask = self._regional_prompt_mask(condition, frame.width, frame.height)
-            if mask is None or not mask.getbbox():
+            if mask is None:
+                skipped.append((label, "no painted prompt_mask"))
+                continue
+            if not mask.getbbox():
+                skipped.append((label, "prompt_mask all-zero"))
                 continue
             region_negative = str(condition.negative_prompt or negative_prompt or "").strip()
             region_frame = frame.model_copy(update={"prompt": prompt_text})
             prompt_kwargs = self._realtime_prompt_kwargs(region_frame, region_negative or None, guidance_scale)
             prompt_embeds = prompt_kwargs.get("prompt_embeds")
             if prompt_embeds is None:
+                skipped.append((label, "no prompt_embeds"))
                 continue
             negative_embeds = prompt_kwargs.get("negative_prompt_embeds")
             regions.append(RegionalAttentionRegion(
@@ -2329,8 +2348,15 @@ class DiffusionEngine:
                 mask=mask,
                 weight=max(0.0, min(1.0, float(condition.weight or 1.0))),
             ))
+        if skipped:
+            logger.info("regional-attn: %d region(s) skipped: %s", len(skipped), skipped)
         if not regions:
+            logger.info("regional-attn: no usable regions -> no attention overlay")
             return None
+        logger.info(
+            "regional-attn: %d region(s) active (overlap policy: weighted-sum normalised by alpha_sum)",
+            len(regions),
+        )
         return RegionalAttentionSpec(regions=tuple(regions), width=frame.width, height=frame.height)
 
     @staticmethod
