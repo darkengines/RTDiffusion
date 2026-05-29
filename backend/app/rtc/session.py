@@ -1268,6 +1268,12 @@ class InpaintSession:
         # max-passes budget below.
         while self._running:
             await self._input_event.wait()
+            # Drain pending fires before reading state -- prevents a tight
+            # loop in stream mode from queueing N events for N edits the
+            # user made during the previous inference. We only want ONE
+            # iteration that reads the LATEST state.
+            self._input_event.clear()
+            await asyncio.sleep(0)  # yield so any pending apply_* runs
             self._input_event.clear()
             try:
                 # Staging discipline: read the LATEST canvas / motion / settings
@@ -1277,6 +1283,15 @@ class InpaintSession:
                 # input.
                 if not self._settings:
                     continue
+                # Skip-old log: if we just finished gen N and gen M > N+1 is
+                # pending, we're "behind" -- one or more edits got coalesced
+                # into the next dispatch. Not a bug, just visibility.
+                _gap = self._input_generation - max(self._last_completed_generation, _last_published_input_generation)
+                if _gap > 1:
+                    logger.debug(
+                        "RTC[%s] coalesced %d staged edits into one render (latest gen=%d, last completed=%d)",
+                        self._tag, _gap - 1, self._input_generation, self._last_completed_generation,
+                    )
                 media_frame_seq = self._media_frame_seq
                 input_generation = self._input_generation
                 stream_mode = bool(self._settings.get("stream_diffusion"))

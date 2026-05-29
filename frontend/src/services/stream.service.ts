@@ -432,6 +432,29 @@ function _scheduleWebRtcSceneSend() {
   })
 }
 
+// Watchdog: if a scene stays dirty for too long without being scheduled,
+// force-schedule. Catches the "missed events" symptom where some sticky
+// flag (resource backpressure latch, missed input_ready, etc.) leaves a
+// dirty edit hanging until the user does something else that nudges the
+// system. The watchdog fires every 200 ms which is comfortably below the
+// "I noticed the UI didn't react" threshold.
+let _webRtcDirtyWatchdog: number | undefined
+function _ensureWebRtcDirtyWatchdog() {
+  if (_webRtcDirtyWatchdog !== undefined) return
+  _webRtcDirtyWatchdog = window.setInterval(() => {
+    if (_webRtcSceneDirty && !_sendingWebRtcScene && !_webRtcSceneScheduled) {
+      _webRtcWaitingForResourceBackpressure = false  // unstick
+      _scheduleWebRtcSceneSend()
+    }
+  }, 200)
+}
+function _stopWebRtcDirtyWatchdog() {
+  if (_webRtcDirtyWatchdog !== undefined) {
+    window.clearInterval(_webRtcDirtyWatchdog)
+    _webRtcDirtyWatchdog = undefined
+  }
+}
+
 function _canSendSceneWhileBusy() {
   if (!_webRtcLastSceneObject) return false
   // After the initial scene has been established, patch updates can be sent
@@ -864,6 +887,7 @@ export async function startWebRtc() {
   _webRtcLastScene = ''
   _webRtcSceneSeq = 0
   $stream.setKey('status', 'connecting')
+  _ensureWebRtcDirtyWatchdog()
   try {
     const ws = openRenderSessionSocket()
     _sessionSocket = ws
@@ -1153,7 +1177,12 @@ async function _sendSceneRtc() {
     if (sentScene || sentPatch || !forceInputRevision) _webRtcForceInputRevision = false
     _sendingWebRtcScene = false
     if (!sentScene && !sentPatch) _webRtcInputReady = true
-    if (_webRtcSceneDirty && _webRtcInputReady && !_webRtcWaitingForResourceBackpressure) {
+    // Re-schedule on any pending dirty edit. NOT gated on
+    // ``_webRtcWaitingForResourceBackpressure`` -- the actual send
+    // re-checks the channel's bufferedAmount on entry, so a stale latch
+    // can't hide here. Gating the re-schedule on it produced the
+    // user-reported "missed events; one action unlocks it" symptom.
+    if (_webRtcSceneDirty && _webRtcInputReady) {
       _scheduleWebRtcSceneSend()
     }
   }
@@ -1253,6 +1282,7 @@ export function stopWebRtc() {
   if (_stoppingWebRtc) return
   _stoppingWebRtc = true
   _webRtcLifecycleSeq++
+  _stopWebRtcDirtyWatchdog()
   for (const state of Object.values(_realtimeEventStates)) {
     if (state.timer !== undefined) {
       window.clearTimeout(state.timer)
