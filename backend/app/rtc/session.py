@@ -345,6 +345,11 @@ class InpaintSession:
         self._last_scene_id: str = ""
         self._last_scene_seq: int = 0
         self._motion_transform: list[float] | None = None
+        # v2 mask diagnostic: per-condition rows captured each frame so the
+        # dashboard can render them as a table. Stays empty until the first
+        # render. List of dicts -- see ``_capture_v2_diag`` for the shape.
+        self._v2_diag_rows: list[dict[str, Any]] = []
+        self._v2_diag_meta: dict[str, Any] = {}
         self._input_generation: int = 0
         self._queued_scene_id: str = ""
         self._queued_at_iso: str = ""
@@ -482,6 +487,92 @@ class InpaintSession:
             "last_latency_ms": float(self._last_latency_ms),
             "last_end_to_end_ms": float(self._last_end_to_end_ms),
             "step_info": step_info,
+            "v2_diag_rows": list(self._v2_diag_rows),
+            "v2_diag_meta": dict(self._v2_diag_meta),
+        }
+
+    def _capture_v2_diag(
+        self,
+        *,
+        materialized_conditions: list[dict[str, Any]],
+        plan: Any | None,
+        base_prompt: str,
+        base_cfg: float,
+        base_denoise: float,
+        w: int,
+        h: int,
+    ) -> None:
+        """Snapshot per-condition mask state for the dashboard's v2 masks
+        table. Called from ``_infer_sync`` after blob refs are resolved but
+        before the engine runs, so the rows reflect what the engine WILL
+        receive.
+        """
+        rows: list[dict[str, Any]] = []
+        # First: one row per legacy layer_condition (drives the SDXL
+        # regional CLIP path through engine.py).
+        for cond in materialized_conditions:
+            prompt_text = str(cond.get("prompt") or "").strip()
+            label_layer = str(cond.get("layer_id") or "?")[:18]
+            label_region = str(cond.get("region_id") or cond.get("name") or "")[:14]
+            pm = cond.get("prompt_mask")
+            pm_status = "missing"
+            mask_nz = -1
+            if isinstance(pm, str) and pm.startswith("data:"):
+                pm_status = "data-url"
+                try:
+                    _, _, payload = pm.partition(",")
+                    raw = base64.b64decode(payload)
+                    img = Image.open(io.BytesIO(raw)).convert("L")
+                    if img.size != (w, h):
+                        img = img.resize((w, h), Image.Resampling.NEAREST)
+                    arr = np.asarray(img, dtype=np.uint8)
+                    mask_nz = int((arr > 0).sum())
+                except Exception:
+                    pm_status = "decode-fail"
+            elif isinstance(pm, str) and pm:
+                pm_status = "raw-id"  # bare blob id reached the engine -- bug
+            ref = cond.get("prompt_mask_ref_name") or cond.get("prompt_mask_ref")
+            if pm_status == "missing" and ref:
+                pm_status = f"ref-unresolved({str(ref)[:8]})"
+            rows.append({
+                "kind": "v1",
+                "layer": label_layer,
+                "region": label_region,
+                "prompt": prompt_text[:24],
+                "mask_nz": mask_nz,
+                "pm_status": pm_status,
+                "cfg": float(cond.get("cfg") or 0.0) if cond.get("cfg") is not None else None,
+                "denoise": float(cond.get("denoise") or 0.0) if cond.get("denoise") is not None else None,
+            })
+        # Then: one row per v2 plan prompt (drives StreamDiffusion + my v2
+        # layer_regions in this file). The plan is None when the v2 wire
+        # fields weren't present -- in that case the SDXL renderer is the
+        # only path active and rows above are the only source of truth.
+        if plan is not None:
+            for pi, p in enumerate(plan.prompts):
+                mask_nz = -1
+                if p.mask is not None:
+                    try:
+                        mask_nz = int((p.mask > 0).sum())
+                    except Exception:
+                        mask_nz = -2
+                rows.append({
+                    "kind": "v2",
+                    "layer": f"v2:{pi}",
+                    "region": "",
+                    "prompt": str(p.text)[:24],
+                    "mask_nz": mask_nz,
+                    "pm_status": "v2-self" if p.mask is not None else "v2-whole",
+                    "cfg": None,
+                    "denoise": None,
+                })
+        self._v2_diag_rows = rows
+        self._v2_diag_meta = {
+            "base_prompt": (base_prompt or "")[:32],
+            "base_cfg": float(base_cfg),
+            "base_denoise": float(base_denoise),
+            "width": int(w),
+            "height": int(h),
         }
 
     @property
@@ -1975,6 +2066,21 @@ class InpaintSession:
                                 inline_url = _data_url(mime or "image/png", bytes(data))
                     if inline_url is not None:
                         _cond[inline_field] = inline_url
+            # Capture v2 mask diagnostic AFTER ref resolution so the
+            # dashboard table reflects exactly what the engine will see.
+            # ``plan`` may be None when the frontend didn't ship the v2
+            # wire fields -- only legacy condition rows are then captured.
+            try:
+                self._capture_v2_diag(
+                    materialized_conditions=materialized_conditions,
+                    plan=locals().get("plan"),
+                    base_prompt=base_prompt,
+                    base_cfg=composed_cfg,
+                    base_denoise=base_denoise,
+                    w=w, h=h,
+                )
+            except Exception:
+                pass
             frame = InpaintFrame(
                 client_frame_id=int(settings.get("client_frame_id") or self._last_frame_seq or self._input_generation),
                 client_input_id=int(settings.get("client_input_id") or self._input_generation),
@@ -2158,6 +2264,21 @@ class InpaintSession:
             )
             debug_channels[f"cn:{cn_label}"] = cn_image
 
+        # Capture v2 mask diagnostic for the stream path so the dashboard
+        # table reflects what the StreamInferenceSession will see. The
+        # stream path doesn't use materialized_conditions -- ``plan`` and
+        # ``layer_regions`` are the source of truth here.
+        try:
+            self._capture_v2_diag(
+                materialized_conditions=[dict(c) for c in layer_conditions],
+                plan=locals().get("plan"),
+                base_prompt=base_prompt,
+                base_cfg=composed_cfg,
+                base_denoise=base_denoise,
+                w=w, h=h,
+            )
+        except Exception:
+            pass
         # Route the live StreamSession through the InferenceSession seam
         # (Step 6a). Composition logic above is unchanged; the adapter just
         # marshals args onto StreamSession.infer.

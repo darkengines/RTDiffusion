@@ -111,10 +111,66 @@ class ConsoleDashboard:
             "Connections",
             self._render_connections_table(sessions, width),
             "",
+            "v2 masks (last frame seen by each session)",
+            self._render_v2_masks_table(sessions, width),
+            "",
             "Tasks",
             self._render_tasks_table(tasks, width),
         ]
         return "\n".join(lines)
+
+    def _render_v2_masks_table(self, sessions: list[dict[str, object]], width: int) -> str:
+        # Aggregate one row per (session, layer condition) plus per (session,
+        # v2 prompt) so the user can see whether painted masks reach the
+        # engine and through which path (legacy SDXL CLIP regional attention
+        # vs the new v2 layer_regions). Empty table when no session has run
+        # an inference yet.
+        rows: list[list[str]] = []
+        for session in sessions:
+            tag = str(session.get("tag") or "-")[:8]
+            diag_rows = session.get("v2_diag_rows") or []
+            diag_meta = session.get("v2_diag_meta") or {}
+            base_prompt = str(diag_meta.get("base_prompt") or "")[:18]
+            base_cfg = float(diag_meta.get("base_cfg") or 0.0)
+            base_denoise = float(diag_meta.get("base_denoise") or 0.0)
+            if not isinstance(diag_rows, list) or not diag_rows:
+                rows.append([tag, "(no v2 data)", "", "", "-", "", f"{base_cfg:.2f}", f"{base_denoise:.2f}", base_prompt])
+                continue
+            for row in diag_rows:
+                kind = str(row.get("kind") or "?")
+                layer = str(row.get("layer") or "?")[:18]
+                region = str(row.get("region") or "")[:12]
+                prompt = str(row.get("prompt") or "")[:24]
+                nz_raw = row.get("mask_nz")
+                if isinstance(nz_raw, int) and nz_raw >= 0:
+                    nz = f"{nz_raw}"
+                elif isinstance(nz_raw, int) and nz_raw == -1:
+                    nz = "-"
+                else:
+                    nz = "?"
+                status = str(row.get("pm_status") or "")[:18]
+                cfg = row.get("cfg")
+                den = row.get("denoise")
+                cfg_str = f"{float(cfg):.2f}" if isinstance(cfg, (int, float)) else "-"
+                den_str = f"{float(den):.2f}" if isinstance(den, (int, float)) else "-"
+                rows.append([
+                    tag, f"{kind}:{layer}", region, prompt, nz, status, cfg_str, den_str, base_prompt,
+                ])
+        if not rows:
+            return "(no v2 mask data yet -- render at least one frame)"
+        prompt_col = max(20, width - 90)
+        columns = [
+            ("session", 8),
+            ("layer", 22),
+            ("region", 12),
+            ("prompt", prompt_col),
+            ("mask_nz", 8),
+            ("status", 18),
+            ("cfg", 5),
+            ("denoise", 7),
+            ("base", 18),
+        ]
+        return _format_table(columns, rows)
 
     def _render_connections_table(self, sessions: list[dict[str, object]], width: int) -> str:
         if not sessions:
