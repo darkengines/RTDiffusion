@@ -149,9 +149,38 @@ class StreamInferenceSession:
                 if region_prompt_signatures is None:
                     region_prompt_signatures = {}
                     setattr(self.stream, "_region_prompt_signatures", region_prompt_signatures)
+                # Prune buffers/signatures for regions that no longer exist.
+                # When the frontend removes a layer or a prompt, the matching
+                # key vanishes from layer_regions; without this cleanup, the
+                # stale entries persisted (and could be picked up again if the
+                # key was reused with a different shape), bleeding "burned-in"
+                # latent state into the next region that got the same key.
+                live_keys = {
+                    f"{region.get('layer_id', '')}:{region.get('region_id', '')}"
+                    for region in layer_regions
+                }
+                for stale in list(region_buffers.keys()):
+                    if stale not in live_keys:
+                        region_buffers.pop(stale, None)
+                        region_prompt_signatures.pop(stale, None)
                 for region in layer_regions:
                     region_key = f"{region.get('layer_id', '')}:{region.get('region_id', '')}"
-                    region_prompt = f"{base_prompt_signature}\0{str(region.get('prompt') or '')}"
+                    # Include the mask's presence + bbox in the signature so
+                    # painting then erasing a prompt mask (same key, same
+                    # prompt text, different mask shape) triggers a latent
+                    # reset. Without this the per-region latent retained the
+                    # refinements made through the small painted region and
+                    # the next frame, with a fuller mask, smeared those
+                    # features across the layer.
+                    region_mask_img = region.get("mask")
+                    mask_sig = ""
+                    if region_mask_img is not None:
+                        try:
+                            box = region_mask_img.convert("L").getbbox() if hasattr(region_mask_img, "convert") else None
+                            mask_sig = f"bbox={box}"
+                        except Exception:
+                            mask_sig = "bbox=?"
+                    region_prompt = f"{base_prompt_signature}\0{str(region.get('prompt') or '')}\0{mask_sig}"
                     previous_region_prompt = region_prompt_signatures.get(region_key)
                     if previous_region_prompt != region_prompt:
                         if previous_region_prompt is None:
