@@ -132,10 +132,23 @@ export async function buildSceneFromLayerConditions(
       denoiseBind: denMask ? 'self' : channelBind,
     })
 
-    // Per-layer prompt mask: shared across regions of the same layer.
-    // canvas-editor stores one mask per (layer, channel) regardless of
-    // region count -- the override path returns that single canvas. We
-    // reuse it for every prompt of the layer.
+    // Per-prompt attention mask priority order (mirrors the backend's
+    // ``_regional_prompt_mask`` so both engines stay consistent):
+    //
+    //   1. ``opts.maskOverride('prompt')`` -- the user explicitly painted
+    //      on the layer's prompt channel. Shared across all regions of
+    //      this layer (canvas-editor stores one mask per layer*channel).
+    //   2. ``r.prompt_mask`` data URL -- legacy inline export.
+    //   3. ``r.image`` alpha channel -- the per-region painted area
+    //      extracted by canvas-editor's exportLayerRegionConditionImage
+    //      via colour-match against the layer's color mask. The painted
+    //      alpha IS the soft weight per the user-confirmed design:
+    //      "painting a prompt region should be the same as painting the
+    //      CFG region (it is a weight soft map) the color is just an ID".
+    //      Without this fallback, color-tinted region painting (the
+    //      standard region-definition workflow) produces a v2 wire
+    //      prompt with no mask -> bind=rgba -> attention covers the
+    //      whole layer instead of just the region.
     const sharedPromptMask = opts.maskOverride?.(layerId, 'prompt') ?? null
     for (const r of regions) {
       const text = (r.prompt ?? '').trim()
@@ -143,6 +156,24 @@ export async function buildSceneFromLayerConditions(
       let mask: Uint8ClampedArray | null = sharedPromptMask
       if (!mask && r.prompt_mask) {
         mask = await _safeMask(decoder, r.prompt_mask, width, height)
+      }
+      if (!mask && r.image) {
+        // Decode the region's image and lift its alpha channel as the
+        // soft-weight prompt mask. The decoder cache makes this cheap
+        // for repeated frames where r.image is unchanged.
+        try {
+          const rgbaBuf = await decoder.decodeRgba(r.image, width, height)
+          const alpha = new Uint8ClampedArray(width * height)
+          let hasNonZero = false
+          for (let i = 0, j = 0; i < alpha.length; i++, j += 4) {
+            const a = rgbaBuf[j + 3]
+            alpha[i] = a
+            if (a > 0) hasNonZero = true
+          }
+          if (hasNonZero) mask = alpha
+        } catch {
+          // decode failed -> leave mask null, fall through to bind=rgba
+        }
       }
       layer.addPrompt({
         text,
