@@ -81,7 +81,7 @@ export function createCanvasPngEncoder(canvasFactory: () => HTMLCanvasElement): 
       const c = canvasFactory()
       c.width = w
       c.height = h
-      const ctx = c.getContext('2d', { alpha: true })
+      const ctx = c.getContext('2d', { alpha: true, willReadFrequently: true })
       if (!ctx) throw new Error('encodeRgba: 2d context unavailable')
       ctx.clearRect(0, 0, w, h)
       const id = new ImageData(buf as Uint8ClampedArray<ArrayBuffer>, w, h)
@@ -92,7 +92,7 @@ export function createCanvasPngEncoder(canvasFactory: () => HTMLCanvasElement): 
       const c = canvasFactory()
       c.width = w
       c.height = h
-      const ctx = c.getContext('2d', { alpha: false })
+      const ctx = c.getContext('2d', { alpha: false, willReadFrequently: true })
       if (!ctx) throw new Error('encodeLuminance: 2d context unavailable')
       const rgba = new Uint8ClampedArray(w * h * 4)
       for (let i = 0; i < w * h; i++) {

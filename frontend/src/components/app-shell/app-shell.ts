@@ -291,7 +291,9 @@ export class RtdAppShell extends LitElement {
 
   // Lazy reusable canvas for the v2 encoder + decoder so we don't allocate
   // one per frame. Allocated on first use; survives for the lifetime of the
-  // shell.
+  // shell. Encoder + decoder share the canvas; the decoder's
+  // ``willReadFrequently:true`` context creation wins (first-call attrs are
+  // sticky), which is fine because the encoder doesn't getImageData.
   private _v2Canvas: HTMLCanvasElement | null = null
   private _v2CanvasFactory = () => {
     if (!this._v2Canvas) this._v2Canvas = document.createElement('canvas')
@@ -299,6 +301,9 @@ export class RtdAppShell extends LitElement {
   }
   private _v2Encoder = createCanvasPngEncoder(this._v2CanvasFactory)
   private _v2Decoder = createDomImageDecoder(this._v2CanvasFactory)
+  private _v2LastInputsKey: string = ''
+  private _v2LastWireFields: Record<string, unknown> | null = null
+  private _v2LoggedOnce = false
 
   private async _augmentWithV2(
     settings: Record<string, unknown>,
@@ -308,6 +313,16 @@ export class RtdAppShell extends LitElement {
     const w = Number(sceneSettings.width) || 0
     const h = Number(sceneSettings.height) || 0
     if (!w || !h) return
+    // Skip augmentation when the inputs are identical to the previous
+    // frame -- reuse the cached wire fields. Painting affects layer
+    // condition image/mask data URLs so the key changes on every stroke,
+    // but idle frames between strokes hit the cache and avoid decoding +
+    // aggregating + encoding hundreds of KB of PNG every RAF tick.
+    const inputsKey = JSON.stringify({ w, h, c: layerConditions, s: sceneSettings })
+    if (inputsKey === this._v2LastInputsKey && this._v2LastWireFields) {
+      Object.assign(settings, this._v2LastWireFields)
+      return
+    }
     const scene = await buildSceneFromLayerConditions(layerConditions, {
       width: w,
       height: h,
@@ -318,7 +333,7 @@ export class RtdAppShell extends LitElement {
     }, this._v2Decoder)
     if (scene.layers.length === 0) return
     const wire = aggregatedToWire(aggregate(scene), this._v2Encoder)
-    Object.assign(settings, {
+    const fields: Record<string, unknown> = {
       rgba_b64: wire.rgba_b64,
       cfg_map_b64: wire.cfg_map_b64,
       denoise_map_b64: wire.denoise_map_b64,
@@ -327,7 +342,18 @@ export class RtdAppShell extends LitElement {
       base_negative_prompt: wire.base_negative_prompt,
       base_cfg: wire.base_cfg,
       base_denoise: wire.base_denoise,
-    })
+    }
+    this._v2LastInputsKey = inputsKey
+    this._v2LastWireFields = fields
+    if (!this._v2LoggedOnce) {
+      this._v2LoggedOnce = true
+      console.info('[rtd-v2] augmentation active', {
+        layers: scene.layers.length,
+        prompts: wire.prompts.length,
+        rgbaBytes: wire.rgba_b64?.length ?? 0,
+      })
+    }
+    Object.assign(settings, fields)
   }
 
   private _rtcSceneSettingsPayload() {

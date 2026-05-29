@@ -138,14 +138,50 @@ async function _safeMask(d: ImageDecoder, url: string, w: number, h: number): Pr
 }
 
 /**
- * Production decoder: Image + a single reusable canvas. Pass the same
- * factory to ``createCanvasPngEncoder`` if you want to share one element
- * across the encode + decode paths to keep allocations down.
+ * Production decoder: Image + a single reusable canvas. Caches decoded
+ * buffers keyed by (data-url, width, height) so the same painted layer
+ * isn't re-decoded every frame while the user paints elsewhere.
+ *
+ * The context is created with ``willReadFrequently: true`` because
+ * ``getImageData`` runs on every decode -- the browser otherwise prints
+ * a perf warning and may keep the canvas on the GPU.
+ *
+ * ``_loadImage`` has a hard 1500 ms timeout: a malformed or empty data
+ * URL would otherwise leave the promise pending forever, freezing the
+ * send loop (and consequently the UI's RAF) until the layer is deleted.
  */
+const _DECODE_CACHE_LIMIT = 16
+const _IMAGE_LOAD_TIMEOUT_MS = 1500
+
 export function createDomImageDecoder(canvasFactory: () => HTMLCanvasElement = () => document.createElement('canvas')): ImageDecoder {
+  const cache = new Map<string, Uint8ClampedArray>()
+  const get = (key: string) => {
+    const v = cache.get(key)
+    if (v === undefined) return undefined
+    // LRU touch: re-insert.
+    cache.delete(key)
+    cache.set(key, v)
+    return v
+  }
+  const put = (key: string, value: Uint8ClampedArray) => {
+    cache.set(key, value)
+    while (cache.size > _DECODE_CACHE_LIMIT) {
+      const first = cache.keys().next().value
+      if (first === undefined) break
+      cache.delete(first)
+    }
+  }
+  const decode = async (url: string, w: number, h: number, asRgba: boolean): Promise<Uint8ClampedArray> => {
+    const key = `${asRgba ? 'r' : 'm'}:${w}x${h}:${url}`
+    const cached = get(key)
+    if (cached) return cached
+    const out = await _decode(url, w, h, canvasFactory, asRgba)
+    put(key, out)
+    return out
+  }
   return {
-    decodeRgba(url, w, h) { return _decode(url, w, h, canvasFactory, true) },
-    decodeMask(url, w, h) { return _decode(url, w, h, canvasFactory, false) },
+    decodeRgba(url, w, h) { return decode(url, w, h, true) },
+    decodeMask(url, w, h) { return decode(url, w, h, false) },
   }
 }
 
@@ -154,7 +190,7 @@ async function _decode(url: string, w: number, h: number, canvasFactory: () => H
   const c = canvasFactory()
   c.width = w
   c.height = h
-  const ctx = c.getContext('2d', { alpha: true })
+  const ctx = c.getContext('2d', { alpha: true, willReadFrequently: true })
   if (!ctx) throw new Error('decoder: 2d context unavailable')
   ctx.clearRect(0, 0, w, h)
   ctx.drawImage(img, 0, 0, w, h)
@@ -174,9 +210,20 @@ async function _decode(url: string, w: number, h: number, canvasFactory: () => H
 
 function _loadImage(url: string): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
+    if (!url || typeof url !== 'string') {
+      reject(new Error('image load: empty url'))
+      return
+    }
     const img = new Image()
-    img.onload = () => resolve(img)
-    img.onerror = (e) => reject(e instanceof Error ? e : new Error('image load failed'))
+    const timer = setTimeout(() => {
+      img.src = ''
+      reject(new Error('image load: timeout'))
+    }, _IMAGE_LOAD_TIMEOUT_MS)
+    img.onload = () => { clearTimeout(timer); resolve(img) }
+    img.onerror = (e) => {
+      clearTimeout(timer)
+      reject(e instanceof Error ? e : new Error('image load failed'))
+    }
     img.src = url
   })
 }
