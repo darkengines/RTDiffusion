@@ -1816,6 +1816,26 @@ class InpaintSession:
             blob_resolver = lambda ref: self.get_blob(ref)  # noqa: E731
             plan = plan_from_wire(settings, blob_resolver=blob_resolver)
             composed_cfg = float(plan.base_cfg) if plan.base_cfg else composed_cfg
+            # Diagnostic: one INFO line per scene showing what the v2 path
+            # actually decoded. ``mask_nz`` is the non-zero pixel count of
+            # each prompt's attention mask -- 0 means the painted prompt
+            # mask never reached the backend (most likely the frontend lift
+            # returning null) and the prompt will behave as unconstrained.
+            try:
+                _prompt_diag = [
+                    f"{p.text[:16]!r}:nz={int((p.mask > 0).sum()) if p.mask is not None else '-'}"
+                    for p in plan.prompts
+                ]
+                logger.info(
+                    "RTC[%s] v2 plan: layers=%d prompts=%s base_denoise=%.2f base_cfg=%.2f",
+                    self._tag,
+                    sum(1 for c in layer_conditions),
+                    _prompt_diag,
+                    plan.base_denoise,
+                    plan.base_cfg,
+                )
+            except Exception:
+                pass
             for pi, p in enumerate(plan.prompts):
                 if not p.text:
                     continue
@@ -1911,6 +1931,50 @@ class InpaintSession:
 
             stage_started = time.perf_counter()
             materialized_conditions = [dict(cond) for cond in layer_conditions if cond.get("image")]
+            # Resolve any ``*_mask_ref_name`` blob refs back to inline
+            # ``data:image/png;base64,...`` data URLs so the legacy engine
+            # (which reads ``condition.prompt_mask`` / ``condition.cfg_mask``
+            # / ``condition.denoise_mask`` directly) actually sees the
+            # painted mask. The WebRTC splitter on the frontend extracts
+            # the inline data URL into a blob ref and removes the inline
+            # field; without this resolution, the engine reads an empty
+            # ``prompt_mask`` and the regional CLIP attention silently does
+            # nothing (matched the user-reported "prompt mask alone has no
+            # effect" bug after my Phase-3 ``_regional_prompt_mask`` drop
+            # of the rgba-alpha fallback).
+            for _cond in materialized_conditions:
+                for inline_field, ref_field in (
+                    ("prompt_mask", "prompt_mask_ref_name"),
+                    ("denoise_mask", "denoise_mask_ref_name"),
+                    ("cfg_mask", "cfg_mask_ref_name"),
+                    ("color_mask", "color_mask_ref_name"),
+                ):
+                    if _cond.get(inline_field):
+                        continue
+                    ref = _cond.get(ref_field)
+                    if not isinstance(ref, str) or not ref:
+                        continue
+                    # Two parallel stores keyed by the same ref: the binary
+                    # blob channel (PIL Image) used by the realtime
+                    # WebRTC resources upload, and ``_scene_resources``
+                    # used by the normalized scene-protocol path. Try both.
+                    inline_url: str | None = None
+                    pil = self.get_blob(ref)
+                    if pil is not None:
+                        try:
+                            buf = io.BytesIO()
+                            pil.save(buf, format="PNG")
+                            inline_url = _data_url("image/png", buf.getvalue())
+                        except Exception:
+                            inline_url = None
+                    if inline_url is None:
+                        res = self._scene_resources.get(ref)
+                        if res is not None:
+                            mime, data, _digest = res
+                            if isinstance(data, (bytes, bytearray)) and data:
+                                inline_url = _data_url(mime or "image/png", bytes(data))
+                    if inline_url is not None:
+                        _cond[inline_field] = inline_url
             frame = InpaintFrame(
                 client_frame_id=int(settings.get("client_frame_id") or self._last_frame_seq or self._input_generation),
                 client_input_id=int(settings.get("client_input_id") or self._input_generation),

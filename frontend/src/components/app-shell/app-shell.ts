@@ -357,14 +357,30 @@ export class RtdAppShell extends LitElement {
     const cache = new Map<string, string>()
     for (const cond of layerConditions) {
       const layerId = String((cond.layer_id ?? '') as string)
-      if (!layerId || cond.prompt_mask) continue
+      if (!layerId) continue
+      // Skip only if a real PAINTED-MASK data URL is already in place.
+      // canvas-editor's WebRTC export path pre-fills ``prompt_mask`` with a
+      // blob-id STRING (truthy but not a data URL); leaving that intact
+      // would defeat the backend's data-URL decoder and skip the painted
+      // mask entirely. Same logic for cfg/denoise -- only honour an
+      // existing field if it's already a data URL.
+      const existing = typeof cond.prompt_mask === 'string' ? cond.prompt_mask : ''
+      if (existing.startsWith('data:')) continue
       if (!cache.has(layerId)) {
         const canvas = editor.getLayerChannelMaskCanvas(layerId, 'prompt')
         const mask = canvas ? this._lift8BitMask(canvas, w, h) : null
         cache.set(layerId, mask ? this._encodeMaskToDataUrl(mask, w, h) : '')
       }
       const url = cache.get(layerId)
-      if (url) cond.prompt_mask = url
+      if (url) {
+        cond.prompt_mask = url
+        // The WebRTC splitter extracts ``prompt_mask`` into a blob ref and
+        // then DELETES the inline field. If a stale ``prompt_mask_ref_name``
+        // was set in a previous frame (different mask shape), the splitter
+        // would happily keep using the stale ref. Clearing it forces a
+        // fresh extraction.
+        delete (cond as Record<string, unknown>).prompt_mask_ref_name
+      }
     }
   }
 
