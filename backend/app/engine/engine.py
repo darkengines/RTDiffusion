@@ -2361,24 +2361,43 @@ class DiffusionEngine:
 
     @staticmethod
     def _regional_prompt_mask(condition: LayerCondition, width: int, height: int) -> Image.Image | None:
-        # User-reported bug: "regional CLIP condition is working only on an
-        # existing rgba area, it should apply even without rgba channel."
-        # Root cause was the rgba-alpha fallback below: when a prompt has no
-        # painted prompt_mask, the code took the layer's rgba alpha as the
-        # regional attention mask -- which coupled the prompt's spatial
-        # extent to where the user happened to have painted RGBA pixels.
-        # On a transparent layer the alpha was zero everywhere, so the
-        # regional attention silently degenerated to no effect.
+        # Priority order for the regional CLIP attention mask:
         #
-        # New behavior: when no prompt_mask is provided the prompt has no
-        # spatial constraint; the regional attention is skipped (caller
-        # treats a None return as "no regional pass for this prompt") and
-        # the prompt still influences output through the base pass / global
-        # prompt aggregation. To get spatial gating, paint a prompt mask.
+        #   1. ``condition.prompt_mask`` -- the user explicitly painted on
+        #      the prompt channel (via the v2 frontend ``_patchLegacyPromptMasks``
+        #      or any other inline path). Highest priority because it's
+        #      what the user explicitly wanted to gate the prompt with.
+        #
+        #   2. ``condition.image``'s alpha channel -- the per-region
+        #      painted area. canvas-editor's region system stores
+        #      spatial extent in the LAYER COLOR mask, color-tinted per
+        #      region; ``exportLayerRegionConditionImage`` then extracts
+        #      this region's slice via colour match and renders it with
+        #      that alpha. So alpha IS where this region applies. Without
+        #      this fallback, color-tinted region painting (the normal way
+        #      regions are defined in the UI) silently produces no
+        #      regional attention -- the user-reported "no dog" symptom
+        #      even with the painted region + prompt set.
+        #
+        # The earlier removal of (2) was wrong: the "rgba coupling" the
+        # user originally complained about was a different bug (engine
+        # disabled regional attention entirely for turbo models / cfg<=1
+        # AND no path injected the painted prompt mask). Both are now
+        # fixed; falling back to image-alpha here is what the legacy code
+        # always did and is the only way color-tinted regions work.
         try:
-            if not condition.prompt_mask:
+            mask: Image.Image | None = None
+            if condition.prompt_mask:
+                mask = decode_data_url(condition.prompt_mask).convert("L").resize(
+                    (width, height), Image.Resampling.BILINEAR,
+                )
+            elif condition.image:
+                rgba = decode_data_url_rgba(condition.image).resize(
+                    (width, height), Image.Resampling.LANCZOS,
+                )
+                mask = rgba.getchannel("A")
+            if mask is None:
                 return None
-            mask = decode_data_url(condition.prompt_mask).convert("L").resize((width, height), Image.Resampling.BILINEAR)
             if condition.cfg_mask:
                 cfg_mask = _cfg_mask_attention_alpha(_decode_cfg_mask_data_url(condition.cfg_mask, width, height))
                 return ImageChops.multiply(mask, cfg_mask)
