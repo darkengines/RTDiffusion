@@ -155,7 +155,7 @@ class ConsoleDashboard:
                     nz = "-"
                 else:
                     nz = "?"
-                status = str(row.get("pm_status") or "")[:18]
+                status = str(row.get("pm_status") or "")
                 cfg = row.get("cfg")
                 den = row.get("denoise")
                 cfg_str = f"{float(cfg):.2f}" if isinstance(cfg, (int, float)) else "-"

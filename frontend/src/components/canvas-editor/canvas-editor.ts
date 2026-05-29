@@ -4355,6 +4355,25 @@ export class RtdCanvasEditor extends LitElement {
    */
   public getLayerChannelMaskCanvas(layerId: string, channel: MaskChannel): HTMLCanvasElement | null {
     if (!layerId) return null
+    // Flush the live drawing canvas (``maskCanvasElement``) into the
+    // persistent ``channelMaskCanvases`` map BEFORE the lookup -- without
+    // this, any paint strokes made while the active scope+channel didn't
+    // match the requested (layerId, channel) live only in the shared
+    // element and our lookup misses them. The user-reported "painted
+    // prompt mask has no effect" was exactly this: the user paints, then
+    // shifts focus (away from the layer or to another tool), the active
+    // scope changes, and the next frame export queries the prompt-mask
+    // store before the live canvas has been copied across.
+    //
+    // ``regionChannelMaskBlob`` (the v1 export helper that actually
+    // worked) does the same save first, see line ~6306. Mirroring it
+    // here keeps the v2 patch in sync with v1 semantics.
+    try {
+      this.saveCurrentMaskScope()
+    } catch {
+      // Defensive: if the save throws (no active scope, no live canvas
+      // yet), fall through to the lookup -- worst case we return null.
+    }
     return this.existingMaskCanvasForScopeChannel(`layer:${layerId}` as MaskScope, channel) ?? null
   }
 
