@@ -37,7 +37,7 @@ import type { LayerPreset, MaskChannel, RegionItem, RegionTarget, ScenePanelTab,
 // stay alongside for ControlNet / tagger plumbing.
 import { aggregate } from '../../model/aggregator'
 import { aggregatedToWire, createCanvasPngEncoder } from '../../model/encoder'
-import { buildSceneFromLayerConditions, createDomImageDecoder, type LegacyLayerCondition } from '../../model/from-layer-conditions'
+import { buildSceneFromLayerConditions, createDomImageDecoder, type LegacyLayerCondition, type MaskChannelKind } from '../../model/from-layer-conditions'
 
 import '../toolbar/toolbar'
 import '../layer-list/layer-list'
@@ -301,9 +301,41 @@ export class RtdAppShell extends LitElement {
   }
   private _v2Encoder = createCanvasPngEncoder(this._v2CanvasFactory)
   private _v2Decoder = createDomImageDecoder(this._v2CanvasFactory)
-  private _v2LastInputsKey: string = ''
-  private _v2LastWireFields: Record<string, unknown> | null = null
   private _v2LoggedOnce = false
+  // Tiny scratch canvas for lifting painted mask canvases to Uint8 buffers.
+  // Kept distinct from _v2Canvas so the mask-lift doesn't clobber the
+  // shared encode/decode canvas mid-augmentation.
+  private _v2MaskCanvas: HTMLCanvasElement | null = null
+
+  private _lift8BitMask(source: HTMLCanvasElement, w: number, h: number): Uint8ClampedArray | null {
+    try {
+      if (!this._v2MaskCanvas) this._v2MaskCanvas = document.createElement('canvas')
+      const c = this._v2MaskCanvas
+      c.width = w
+      c.height = h
+      const ctx = c.getContext('2d', { alpha: true, willReadFrequently: true })
+      if (!ctx) return null
+      ctx.clearRect(0, 0, w, h)
+      // drawImage scales the source mask canvas (which is at stage size
+      // by default) to the target wxh -- the engine sees a mask sized to
+      // the inference resolution. Bilinear by default; OK for masks.
+      ctx.drawImage(source, 0, 0, w, h)
+      const id = ctx.getImageData(0, 0, w, h)
+      const out = new Uint8ClampedArray(w * h)
+      // Painted masks come in as RGBA with the tint in RGB and the
+      // user's "intensity" in alpha. The legacy stack used alpha as the
+      // mask value -- mirror that so painted strength feels the same.
+      for (let i = 0, j = 0; i < out.length; i++, j += 4) {
+        out[i] = id.data[j + 3]
+      }
+      // All-zero mask -> treat as "no mask" so the bind falls back to rgba.
+      let any = false
+      for (let i = 0; i < out.length; i++) if (out[i] > 0) { any = true; break }
+      return any ? out : null
+    } catch {
+      return null
+    }
+  }
 
   private async _augmentWithV2(
     settings: Record<string, unknown>,
@@ -313,16 +345,18 @@ export class RtdAppShell extends LitElement {
     const w = Number(sceneSettings.width) || 0
     const h = Number(sceneSettings.height) || 0
     if (!w || !h) return
-    // Skip augmentation when the inputs are identical to the previous
-    // frame -- reuse the cached wire fields. Painting affects layer
-    // condition image/mask data URLs so the key changes on every stroke,
-    // but idle frames between strokes hit the cache and avoid decoding +
-    // aggregating + encoding hundreds of KB of PNG every RAF tick.
-    const inputsKey = JSON.stringify({ w, h, c: layerConditions, s: sceneSettings })
-    if (inputsKey === this._v2LastInputsKey && this._v2LastWireFields) {
-      Object.assign(settings, this._v2LastWireFields)
-      return
-    }
+    // No augmentation-level cache: the painted mask canvases live outside
+    // of ``layerConditions`` (they're lifted via ``maskOverride`` below),
+    // so a stringify-of-layer-conditions key cannot detect "user painted
+    // another stroke into the prompt mask". The decoder's URL-keyed cache
+    // still skips re-decoding the RGBA when a layer image is unchanged.
+    const editor = this._editor
+    const maskOverride = editor
+      ? (layerId: string, channel: MaskChannelKind): Uint8ClampedArray | null => {
+          const canvas = editor.getLayerChannelMaskCanvas(layerId, channel)
+          return canvas ? this._lift8BitMask(canvas, w, h) : null
+        }
+      : undefined
     const scene = await buildSceneFromLayerConditions(layerConditions, {
       width: w,
       height: h,
@@ -330,6 +364,7 @@ export class RtdAppShell extends LitElement {
       baseNegativePrompt: String(sceneSettings.negative_prompt ?? ''),
       baseCfg: Number(sceneSettings.cfg ?? 1.5),
       baseDenoise: Number(sceneSettings.strength ?? 1.0),
+      maskOverride,
     }, this._v2Decoder)
     if (scene.layers.length === 0) return
     const wire = aggregatedToWire(aggregate(scene), this._v2Encoder)
@@ -343,8 +378,6 @@ export class RtdAppShell extends LitElement {
       base_cfg: wire.base_cfg,
       base_denoise: wire.base_denoise,
     }
-    this._v2LastInputsKey = inputsKey
-    this._v2LastWireFields = fields
     if (!this._v2LoggedOnce) {
       this._v2LoggedOnce = true
       console.info('[rtd-v2] augmentation active', {

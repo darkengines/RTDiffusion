@@ -140,6 +140,67 @@ describe('buildSceneFromLayerConditions', () => {
     expect(s.layers.map(l => l.id)).toEqual(['L2'])
   })
 
+  it('maskOverride wins over inline data URLs for cfg/denoise/prompt', async () => {
+    const overridePromptMask = new Uint8ClampedArray(16).fill(99)
+    const overrideCfgMask = new Uint8ClampedArray(16).fill(77)
+    const conds: LegacyLayerCondition[] = [
+      { layer_id: 'L1', image: 'A',
+        prompt: 'cat', prompt_mask: 'inline-prompt',
+        cfg_mask: 'inline-cfg' },
+    ]
+    const dec = stubDecoder()
+    const s = await buildSceneFromLayerConditions(conds, {
+      ...baseOpts,
+      maskOverride: (layerId, channel) => {
+        if (channel === 'prompt') return overridePromptMask
+        if (channel === 'cfg') return overrideCfgMask
+        return null
+      },
+    }, dec)
+    const l = s.layers[0]
+    expect(l.cfgMask).toBe(overrideCfgMask)
+    expect(l.cfgBind).toBe('self')
+    expect(l.prompts[0].mask).toBe(overridePromptMask)
+    expect(l.prompts[0].bind).toBe('self')
+    // The inline data URLs were never decoded:
+    expect(dec.maskCalls.map(c => c.url)).not.toContain('inline-prompt')
+    expect(dec.maskCalls.map(c => c.url)).not.toContain('inline-cfg')
+  })
+
+  it('maskOverride null falls back to inline data URL', async () => {
+    const conds: LegacyLayerCondition[] = [
+      { layer_id: 'L1', image: 'A', denoise_mask: 'inline-den' },
+    ]
+    const dec = stubDecoder()
+    const s = await buildSceneFromLayerConditions(conds, {
+      ...baseOpts,
+      maskOverride: () => null,
+    }, dec)
+    expect(s.layers[0].denoiseMask).not.toBeNull()
+    expect(dec.maskCalls.map(c => c.url)).toContain('inline-den')
+  })
+
+  it('prompt-channel override is reused across regions of the same layer', async () => {
+    const sharedMask = new Uint8ClampedArray(16).fill(50)
+    const conds: LegacyLayerCondition[] = [
+      { layer_id: 'L1', image: 'A', region_id: 'R1', prompt: 'cat' },
+      { layer_id: 'L1', region_id: 'R2', prompt: 'dog' },
+      { layer_id: 'L2', image: 'B', region_id: 'R3', prompt: 'sky' },
+    ]
+    const s = await buildSceneFromLayerConditions(conds, {
+      ...baseOpts,
+      maskOverride: (layerId, channel) => {
+        if (channel === 'prompt' && layerId === 'L1') return sharedMask
+        return null
+      },
+    }, stubDecoder())
+    const l1 = s.layers.find(l => l.id === 'L1')!
+    const l2 = s.layers.find(l => l.id === 'L2')!
+    expect(l1.prompts[0].mask).toBe(sharedMask)
+    expect(l1.prompts[1].mask).toBe(sharedMask)
+    expect(l2.prompts[0].mask).toBeNull()  // L2 had no override
+  })
+
   it('mask decode failure leaves mask null but keeps the prompt', async () => {
     const dec = stubDecoder()
     const original = dec.decodeMask

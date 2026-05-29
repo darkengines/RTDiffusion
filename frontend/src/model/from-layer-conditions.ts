@@ -31,6 +31,18 @@ export interface LegacyLayerCondition {
   prompt_mask?: string | null
 }
 
+export type MaskChannelKind = 'cfg' | 'denoise' | 'prompt'
+
+/**
+ * Optional callback that lets the caller supply a painted mask directly --
+ * bypasses the data-URL decode path. The legacy ``exportLayerConditions``
+ * dropped ``prompt_mask`` (always undefined inline) and encoded
+ * ``cfg_mask`` in a non-PNG format, so without this hook the v2 path
+ * couldn't see those painted masks at all and prompts behaved like
+ * unmasked text -> "I painted a concept and it wasn't applied".
+ */
+export type MaskOverride = (layerId: string, channel: MaskChannelKind) => Uint8ClampedArray | null
+
 export interface SceneFromLegacyOptions {
   width: number
   height: number
@@ -42,6 +54,8 @@ export interface SceneFromLegacyOptions {
   defaultChannelBind?: ChannelBind
   /** Default binding for prompts when no painted mask is present. */
   defaultPromptBind?: PromptBind
+  /** When set, takes precedence over decoded data URLs for cfg/denoise/prompt masks. */
+  maskOverride?: MaskOverride
 }
 
 /**
@@ -92,11 +106,18 @@ export async function buildSceneFromLayerConditions(
     // them as "active where the layer is visible".
     const firstCfg = regions.find(r => r.cfg != null && r.cfg !== undefined)?.cfg
     const firstDen = regions.find(r => r.denoise != null && r.denoise !== undefined)?.denoise
-    // Optional channel masks: first present wins (one per layer in v2).
-    const cfgMaskUrl = regions.find(r => r.cfg_mask)?.cfg_mask
-    const denMaskUrl = regions.find(r => r.denoise_mask)?.denoise_mask
-    const cfgMask = cfgMaskUrl ? await _safeMask(decoder, cfgMaskUrl, width, height) : null
-    const denMask = denMaskUrl ? await _safeMask(decoder, denMaskUrl, width, height) : null
+    // Optional channel masks: override callback wins (direct canvas access);
+    // else first inline data URL across regions wins.
+    let cfgMask = opts.maskOverride?.(layerId, 'cfg') ?? null
+    if (!cfgMask) {
+      const cfgMaskUrl = regions.find(r => r.cfg_mask)?.cfg_mask
+      if (cfgMaskUrl) cfgMask = await _safeMask(decoder, cfgMaskUrl, width, height)
+    }
+    let denMask = opts.maskOverride?.(layerId, 'denoise') ?? null
+    if (!denMask) {
+      const denMaskUrl = regions.find(r => r.denoise_mask)?.denoise_mask
+      if (denMaskUrl) denMask = await _safeMask(decoder, denMaskUrl, width, height)
+    }
 
     const layer = new Layer({
       id: layerId,
@@ -111,10 +132,18 @@ export async function buildSceneFromLayerConditions(
       denoiseBind: denMask ? 'self' : channelBind,
     })
 
+    // Per-layer prompt mask: shared across regions of the same layer.
+    // canvas-editor stores one mask per (layer, channel) regardless of
+    // region count -- the override path returns that single canvas. We
+    // reuse it for every prompt of the layer.
+    const sharedPromptMask = opts.maskOverride?.(layerId, 'prompt') ?? null
     for (const r of regions) {
       const text = (r.prompt ?? '').trim()
       if (!text) continue
-      const mask = r.prompt_mask ? await _safeMask(decoder, r.prompt_mask, width, height) : null
+      let mask: Uint8ClampedArray | null = sharedPromptMask
+      if (!mask && r.prompt_mask) {
+        mask = await _safeMask(decoder, r.prompt_mask, width, height)
+      }
       layer.addPrompt({
         text,
         negative: (r.negative_prompt ?? '').trim(),

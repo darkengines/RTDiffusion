@@ -4342,6 +4342,22 @@ export class RtdCanvasEditor extends LitElement {
     return this.channelMaskCanvases.get(this.maskChannelKey(scope, channel))
   }
 
+  /**
+   * Public accessor for the v2 layer aggregator -- returns the painted mask
+   * HTMLCanvasElement for a given layer + channel, or null if none has been
+   * painted yet. This bypasses the encoded data-URL round-trip the legacy
+   * ``exportLayerConditions`` does, which dropped ``prompt_mask`` entirely
+   * (the inline export always set it to ``undefined``) and serialised
+   * ``cfg_mask`` in a custom RTF1 float32 format unreadable by ``Image``.
+   *
+   * Returning the live canvas lets the augmentation lift pixels directly
+   * via getImageData. Honoured channels: 'denoise' | 'prompt' | 'cfg'.
+   */
+  public getLayerChannelMaskCanvas(layerId: string, channel: MaskChannel): HTMLCanvasElement | null {
+    if (!layerId) return null
+    return this.existingMaskCanvasForScopeChannel(`layer:${layerId}` as MaskScope, channel) ?? null
+  }
+
   private maskChannelKey(scope: MaskScope, channel: MaskChannel) {
     return `${scope}::${channel}`
   }
