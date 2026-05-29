@@ -130,6 +130,57 @@ describe('aggregate', () => {
     expect(out.prompts.map(p => p.text)).toEqual(['real'])
   })
 
+  it('generate-from-noise: transparent rgba under painted prompt bumps denoise toward 1', () => {
+    // 2-pixel layer with no rgba content, a prompt with a mask painted
+    // on pixel 0 only. denoise_map at pixel 0 should be the prompt's
+    // attention (1.0) even though scene base_denoise is small.
+    const s = new Scene({ width: 2, height: 1, baseDenoise: 0.2 })
+    const layer = new Layer({ id: 'L', width: 2, height: 1 })
+    layer.addPrompt({ text: 'a cat', mask: new Uint8ClampedArray([255, 0]), bind: 'self' })
+    s.addLayer(layer)
+    const out = aggregate(s)
+    expect(out.denoiseMap[0]).toBeCloseTo(1.0, 4)
+    expect(out.denoiseMap[1]).toBeCloseTo(0.2, 4)  // no prompt cover here -> base only
+  })
+
+  it('generate-from-noise: opaque rgba under painted prompt does NOT bump (transform case)', () => {
+    // The layer has opaque rgba -> the engine should transform existing
+    // pixels using the prompt, not regenerate from noise. With layer
+    // denoise set to scene base (the typical case), denoise_map stays
+    // at base wherever the bump rule decides not to fire.
+    const s = new Scene({ width: 2, height: 1, baseDenoise: 0.3 })
+    const layer = new Layer({
+      id: 'L', width: 2, height: 1,
+      rgba: new Uint8ClampedArray([200, 0, 0, 255, 0, 0, 0, 0]),
+      denoise: 0.3, denoiseBind: 'rgba',
+    })
+    layer.addPrompt({ text: 'a cat', mask: new Uint8ClampedArray([255, 0]), bind: 'self' })
+    s.addLayer(layer)
+    const out = aggregate(s)
+    // pixel 0 has rgba alpha=255 -> bump skipped, denoise stays base.
+    expect(out.denoiseMap[0]).toBeCloseTo(0.3, 4)
+  })
+
+  it('generate-from-noise: lower opaque layer protects upper prompt area from bump', () => {
+    // Bottom layer fully opaque -> after composition rgba is opaque
+    // -> upper layer's prompt-on-transparent does NOT trigger bump.
+    const s = new Scene({ width: 2, height: 1, baseDenoise: 0.25 })
+    const bottom = new Layer({
+      id: 'B', width: 2, height: 1,
+      rgba: new Uint8ClampedArray([100, 100, 100, 255, 100, 100, 100, 255]),
+      denoise: 0.25, denoiseBind: 'rgba',
+    })
+    const top = new Layer({
+      id: 'T', width: 2, height: 1,
+      denoise: 0.25, denoiseBind: 'rgba',
+    })
+    top.addPrompt({ text: 'overlay', mask: new Uint8ClampedArray([255, 0]), bind: 'self' })
+    s.addLayer(bottom)
+    s.addLayer(top)
+    const out = aggregate(s)
+    expect(out.denoiseMap[0]).toBeCloseTo(0.25, 4)
+  })
+
   it('controlnet emitted per layer that has one', () => {
     const s = makeScene()
     const a = new Layer({

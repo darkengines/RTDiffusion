@@ -55,6 +55,26 @@ export function aggregate(scene: Scene): AggregatedScene {
     }
   }
 
+  // "Generate from noise" rule: where the final composited rgba is
+  // transparent (no pixel data anywhere below this point) and ANY prompt
+  // covers the pixel, push denoise toward the prompt's attention. Without
+  // this, painting a prompt mask on a fresh empty layer feels broken --
+  // the engine runs img2img over a neutral-gray fallback with denoise
+  // capped at scene baseDenoise (~0.6 typical), so the prompt only mildly
+  // tints the gray. With the bump, denoise reaches the prompt's
+  // attention value (up to 1.0), telling the engine to treat that area
+  // as pure noise and synthesise the prompt's content from scratch.
+  for (let i = 0; i < pixelCount; i++) {
+    if (rgba[i * 4 + 3] > 8) continue
+    let promptCover = 0
+    for (const p of prompts) {
+      if (p.mask === null) { promptCover = 1; break }
+      const v = p.mask[i]
+      if (v > promptCover) promptCover = v
+    }
+    if (promptCover > denoiseMap[i]) denoiseMap[i] = promptCover
+  }
+
   return {
     width,
     height,

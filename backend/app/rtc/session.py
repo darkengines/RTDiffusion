@@ -1814,16 +1814,28 @@ class InpaintSession:
                     mask_img = Image.fromarray((mask_arr * 255.0).round().astype("uint8"), "L")
                 else:
                     mask_img = Image.new("L", (w, h), 255)
-                # denoise_map for this region = aggregated denoise gated by mask.
+                # denoise_map for this region = aggregated denoise gated by
+                # the prompt's attention mask.
                 den_arr = plan.denoise_map
                 if mask_arr is not None:
                     den_arr = den_arr * mask_arr
                 den_img = Image.fromarray((den_arr * 255.0).round().astype("uint8"), "L")
+                # Use the peak denoise within the prompt's region as the
+                # scalar strength passed to ``stream.infer``. StreamDiffusion's
+                # scalar denoise sets the upper bound on noise injected; the
+                # per-pixel denoise_map can only attenuate from there. Using
+                # max(plan.base_denoise, peak) ensures painted-prompt-on-
+                # transparent areas (where the aggregator's "generate from
+                # noise" rule bumped denoise_map toward 1.0) actually get
+                # the engine running at full strength, instead of the
+                # scene's typical 0.4-0.6 base.
+                region_peak_denoise = float(den_arr.max()) if den_arr.size else 0.0
+                region_denoise = max(float(plan.base_denoise), region_peak_denoise)
                 layer_regions.append({
                     "mask": mask_img,
                     "denoise_map": den_img,
                     "prompt": p.text,
-                    "denoise": float(plan.base_denoise),
+                    "denoise": region_denoise,
                     "cfg": composed_cfg,
                     "layer_id": f"v2:{pi}",
                     "region_id": str(pi),
