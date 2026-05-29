@@ -151,7 +151,7 @@ describe('buildSceneFromLayerConditions', () => {
     const dec = stubDecoder()
     const s = await buildSceneFromLayerConditions(conds, {
       ...baseOpts,
-      maskOverride: (layerId, channel) => {
+      maskOverride: (_layerId, channel) => {
         if (channel === 'prompt') return overridePromptMask
         if (channel === 'cfg') return overrideCfgMask
         return null

@@ -302,6 +302,13 @@ export class RtdAppShell extends LitElement {
   private _v2Encoder = createCanvasPngEncoder(this._v2CanvasFactory)
   private _v2Decoder = createDomImageDecoder(this._v2CanvasFactory)
   private _v2LoggedOnce = false
+  private _v2LastStateKey = ''
+
+  private _countNonZero(buf: Uint8ClampedArray): number {
+    let n = 0
+    for (let i = 0; i < buf.length; i++) if (buf[i] > 0) n++
+    return n
+  }
   // Tiny scratch canvas for lifting painted mask canvases to Uint8 buffers.
   // Kept distinct from _v2Canvas so the mask-lift doesn't clobber the
   // shared encode/decode canvas mid-augmentation.
@@ -309,6 +316,7 @@ export class RtdAppShell extends LitElement {
 
   private _lift8BitMask(source: HTMLCanvasElement, w: number, h: number): Uint8ClampedArray | null {
     try {
+      if (source.width === 0 || source.height === 0) return null
       if (!this._v2MaskCanvas) this._v2MaskCanvas = document.createElement('canvas')
       const c = this._v2MaskCanvas
       c.width = w
@@ -317,21 +325,39 @@ export class RtdAppShell extends LitElement {
       if (!ctx) return null
       ctx.clearRect(0, 0, w, h)
       // drawImage scales the source mask canvas (which is at stage size
-      // by default) to the target wxh -- the engine sees a mask sized to
-      // the inference resolution. Bilinear by default; OK for masks.
+      // by default) to the target wxh -- bilinear by default; OK for masks.
       ctx.drawImage(source, 0, 0, w, h)
       const id = ctx.getImageData(0, 0, w, h)
       const out = new Uint8ClampedArray(w * h)
-      // Painted masks come in as RGBA with the tint in RGB and the
-      // user's "intensity" in alpha. The legacy stack used alpha as the
-      // mask value -- mirror that so painted strength feels the same.
+      // canvas-editor uses two distinct mask polarities depending on the
+      // code path:
+      //   - The live brush target is RGBA-alpha based (transparent bg,
+      //     painted strokes have alpha=255 in the brush colour).
+      //   - The canonical "rendered" mask
+      //     (``renderMaskDataCanvas``) is luma-based: painted=white,
+      //     unpainted=black, alpha=255 throughout.
+      // Reading only one channel breaks the OTHER form silently. Taking
+      // the per-pixel max of alpha + r + g + b handles both.
       for (let i = 0, j = 0; i < out.length; i++, j += 4) {
-        out[i] = id.data[j + 3]
+        let v = id.data[j + 3]
+        if (id.data[j] > v) v = id.data[j]
+        if (id.data[j + 1] > v) v = id.data[j + 1]
+        if (id.data[j + 2] > v) v = id.data[j + 2]
+        out[i] = v
       }
       // All-zero mask -> treat as "no mask" so the bind falls back to rgba.
-      let any = false
-      for (let i = 0; i < out.length; i++) if (out[i] > 0) { any = true; break }
-      return any ? out : null
+      // Also reject all-255: canvas-editor sometimes inits a mask canvas to
+      // fully opaque before any paint, which would otherwise read as
+      // "painted everywhere" and the prompt would become unconstrained.
+      let nonZero = 0
+      let allMax = true
+      for (let i = 0; i < out.length; i++) {
+        if (out[i] > 0) nonZero++
+        if (out[i] < 255) allMax = false
+      }
+      if (nonZero === 0) return null
+      if (allMax) return null  // uniform-painted = no signal
+      return out
     } catch {
       return null
     }
@@ -378,14 +404,26 @@ export class RtdAppShell extends LitElement {
       base_cfg: wire.base_cfg,
       base_denoise: wire.base_denoise,
     }
-    if (!this._v2LoggedOnce) {
-      this._v2LoggedOnce = true
-      console.info('[rtd-v2] augmentation active', {
+    // Fire a console.info whenever the v2 shape changes: number of layers,
+    // number of prompts, or which prompts carry a painted attention mask.
+    // Lets the user verify in devtools that painted prompt masks are
+    // actually reaching the wire (and how many non-zero pixels they have)
+    // -- the most common "ignored prompt mask" symptom is the mask being
+    // read as empty due to a polarity / canvas-init mismatch.
+    const promptSigs = scene.layers.flatMap(l =>
+      l.prompts.map(p => `${l.id}/"${p.text.slice(0, 12)}":${p.mask ? this._countNonZero(p.mask) : '-'}`)
+    )
+    const stateKey = `L${scene.layers.length}|P${wire.prompts.length}|${promptSigs.join(',')}`
+    if (stateKey !== this._v2LastStateKey) {
+      this._v2LastStateKey = stateKey
+      console.info('[rtd-v2]', {
         layers: scene.layers.length,
         prompts: wire.prompts.length,
+        promptMasks: promptSigs,
         rgbaBytes: wire.rgba_b64?.length ?? 0,
       })
     }
+    if (!this._v2LoggedOnce) this._v2LoggedOnce = true
     Object.assign(settings, fields)
   }
 
