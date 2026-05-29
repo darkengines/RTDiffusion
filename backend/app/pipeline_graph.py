@@ -356,28 +356,36 @@ def _condition_alpha(cond: Any, width: int, height: int) -> np.ndarray | None:
     """Return the spatial alpha map a condition contributes to the inpaint
     mask. Reads ONLY ``denoise_mask`` -- the painted denoise softmap.
 
-    Decoupled from the prompt softmap on purpose. Per the user-defined
-    semantics, the three layer channels are independent:
+    Per the user-defined semantics: "the denoise mask is 1.0 everywhere
+    by default; the inpainting denoise mask IS the layer denoise mask".
 
-      - prompt softmap   -> drives WHICH prompt at each pixel (regional
-                            CLIP attention; see engine._regional_prompt_mask).
-      - denoise softmap  -> per-pixel multiplier on base inpaint strength.
-                            Default (unpainted) = full base strength
-                            everywhere (the engine's empty_mask + scene
-                            mask + all-white fallback handle that).
-      - cfg softmap      -> per-pixel CFG override; default = global CFG.
+    So:
+      - No painted denoise_mask  -> return all-ones (full-canvas
+                                    coverage). The engine's inpaint mask
+                                    defaults to the whole viewport at
+                                    base_strength.
+      - Painted denoise_mask     -> return the painted alpha as a
+                                    per-pixel multiplier. Paint black to
+                                    PRESERVE specific pixels, paint white
+                                    to denoise, anything in between is a
+                                    soft weight.
 
-    An earlier version made this fall back to ``condition.image`` alpha
-    (the prompt softmap area) which produced soft-edged inpaint masks
-    that blended the new content with untouched source pixels at the
-    boundary -- visible "ugly" edges. The painted prompt area is for
-    regional attention; the engine's existing scene/empty-mask logic
-    plus a full-canvas fallback when no mask is painted is enough for
-    "paint a prompt and see content there" to work.
+    The three layer channels stay independent:
+      - prompt softmap   -> WHICH prompt at each pixel (regional CLIP
+                            attention; see engine._regional_prompt_mask).
+      - denoise softmap  -> per-pixel inpaint multiplier (this function).
+      - cfg softmap      -> per-pixel CFG override.
+
+    Earlier versions returned None for unpainted, which meant the layer
+    contributed nothing to the inpaint mask, so painting RGBA + a prompt
+    only inpainted their intersection -- the user's reported "only the
+    intersection is denoised, the rest of the scene is unchanged" bug.
+    Defaulting to all-ones means each active layer condition asserts
+    "denoise me everywhere unless overridden".
     """
     image_url = _cond_get(cond, "denoise_mask", "")
     if not image_url:
-        return None
+        return np.ones((height, width), dtype=np.float32)
     try:
         _, sep, payload = str(image_url).partition(",")
         raw = base64.b64decode(payload if sep else str(image_url))
@@ -385,7 +393,9 @@ def _condition_alpha(cond: Any, width: int, height: int) -> np.ndarray | None:
         return np.asarray(img.convert("L"), dtype=np.float32) / 255.0
     except Exception as exc:
         logger.warning("Conditioning denoise_mask decode failed: %s", exc)
-        return None
+        # Decode failure also falls back to full coverage so a broken
+        # mask doesn't silently kill the inpaint area entirely.
+        return np.ones((height, width), dtype=np.float32)
 
 
 def _valid_operator(value: str) -> str:
