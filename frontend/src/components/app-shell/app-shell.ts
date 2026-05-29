@@ -351,6 +351,55 @@ export class RtdAppShell extends LitElement {
    * ``prompt_mask: undefined`` in its inline export, so this patch step
    * is the only way to ship the painted mask through the legacy field.
    */
+  /**
+   * For each custom-id region, replace ``cond.image`` with the per-region
+   * softmap data URL (alpha = painted prompt weight, extracted by colour
+   * match against the layer's tinted paint canvas). canvas-editor's
+   * regular ``exportLayerConditions`` only does this for inherited
+   * regions and returns the whole-layer render for custom ones -- which
+   * is empty when the user paints solely on the prompt-softmap channel.
+   * Without this patch the backend's ``_condition_alpha`` image-alpha
+   * fallback sees an all-zero alpha for prompt-bearing regions and no
+   * inpaint mask is generated, so the engine never repaints that area.
+   *
+   * Skips inherited regions (canvas-editor already does the right thing
+   * there) and skips when the extracted softmap is entirely empty (no
+   * paint for this region -- keep the original whole-layer render so
+   * downstream code that consumes condition.image as a "this region's
+   * layer image" still has something).
+   */
+  private _patchCustomRegionImages(layerConditions: LegacyLayerCondition[]): void {
+    const editor = this._editor
+    if (!editor) return
+    for (const cond of layerConditions) {
+      const regionId = String((cond as Record<string, unknown>).region_id ?? '')
+      if (!regionId || regionId.startsWith('inherited:')) continue
+      const layerId = String((cond.layer_id ?? '') as string)
+      if (!layerId) continue
+      try {
+        const canvas = editor.getRegionColorMaskCanvas(layerId, regionId)
+        if (!canvas) continue
+        // Cheap "any non-zero alpha" probe via a small downscaled read.
+        // If the painted area is entirely empty, leave cond.image alone.
+        const probe = document.createElement('canvas')
+        probe.width = 32
+        probe.height = 32
+        const pctx = probe.getContext('2d', { alpha: true, willReadFrequently: true })
+        if (!pctx) continue
+        pctx.clearRect(0, 0, 32, 32)
+        pctx.drawImage(canvas, 0, 0, 32, 32)
+        const data = pctx.getImageData(0, 0, 32, 32).data
+        let any = false
+        for (let i = 3; i < data.length; i += 4) if (data[i] > 0) { any = true; break }
+        if (!any) continue
+        cond.image = canvas.toDataURL('image/png')
+        ;(cond as Record<string, unknown>)._v2_image_patched = true
+      } catch {
+        // ignore, fall through to canvas-editor's whole-layer render
+      }
+    }
+  }
+
   private _patchLegacyPromptMasksLastSig = ''
   private _patchLegacyPromptMasks(layerConditions: LegacyLayerCondition[], w: number, h: number): void {
     const editor = this._editor
@@ -806,19 +855,34 @@ export class RtdAppShell extends LitElement {
           ? await editor.exportLayerConditionsForRtcResources()
           : editor.exportLayerConditions()
         const sceneSettings = this._rtcSceneSettingsPayload()
-        // Patch the legacy ``layer_conditions[*].prompt_mask`` BEFORE the
-        // WebRTC splitter sees the payload -- canvas-editor's inline
-        // exporter sets that field to undefined, which made the engine's
-        // regional CLIP attention fall back to rgba alpha (the
-        // user-reported "regional clip only works on rgba area" bug). The
-        // splitter handles the data-URL form correctly: extracts it as a
-        // blob ref and removes the inline copy.
+        // Patch the legacy ``layer_conditions[*]`` BEFORE the WebRTC
+        // splitter sees the payload. Two patches happen here:
+        //
+        //   1. prompt_mask -- canvas-editor sets this to undefined inline
+        //      so the regional CLIP attention had no spatial map. Inject
+        //      the painted prompt-channel canvas as a data URL.
+        //
+        //   2. image (for CUSTOM regions only) -- canvas-editor's
+        //      exportLayerConditions returns the WHOLE LAYER rgba render
+        //      for non-inherited region ids. But the user paints a
+        //      SOFTMAP per prompt: each prompt region is a soft weight
+        //      mask, and the colour the user paints with is just the
+        //      region's ID (for visual disambiguation between regions
+        //      sharing the layer canvas). The painted softmap lives in
+        //      the layer's tinted-paint canvas, not in the layer's
+        //      rgba. So image's alpha is all-zero and the backend never
+        //      sees the painted area. Replacing cond.image with the
+        //      per-region softmap (color-keyed extraction with alpha =
+        //      painted weight) makes the backend see the real region.
         try {
           const w = Number(sceneSettings.width) || 0
           const h = Number(sceneSettings.height) || 0
-          if (w && h) this._patchLegacyPromptMasks(layerConditions as LegacyLayerCondition[], w, h)
+          if (w && h) {
+            this._patchLegacyPromptMasks(layerConditions as LegacyLayerCondition[], w, h)
+            this._patchCustomRegionImages(layerConditions as LegacyLayerCondition[])
+          }
         } catch (err) {
-          console.warn('[rtd] legacy prompt_mask patch failed', err)
+          console.warn('[rtd] legacy condition patch failed', err)
         }
         const settings: Record<string, unknown> = {
           image,

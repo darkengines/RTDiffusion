@@ -4353,6 +4353,38 @@ export class RtdCanvasEditor extends LitElement {
    * Returning the live canvas lets the augmentation lift pixels directly
    * via getImageData. Honoured channels: 'denoise' | 'prompt' | 'cfg'.
    */
+  /**
+   * For a custom (UUID) region, returns a canvas whose alpha channel
+   * IS the painted area for that region (colour-matched extraction
+   * against the layer's colour mask). For an inherited region, returns
+   * the layer's alpha rendering. Null if the layer or region is
+   * unknown.
+   *
+   * This is the v2 augmentation's source of truth for "where does this
+   * region's prompt apply" -- canvas-editor's regular ``exportLayerConditions``
+   * sets ``image`` to the WHOLE layer render for custom regions, which is
+   * empty when the user paints only on the colour-mask channel (the
+   * default workflow). The result here is the per-region painted area
+   * with soft weights = painted alpha.
+   */
+  public getRegionColorMaskCanvas(layerId: string, regionId: string): HTMLCanvasElement | null {
+    if (!layerId || !regionId) return null
+    const layer = this.layers.find(l => l.id === layerId)
+    if (!layer) return null
+    const region = this.layerRegionSpecs(layer).find(r => r.id === regionId)
+    if (!region) return null
+    try {
+      // Flush any live painting to the persistent stores first so the
+      // colour-match extraction sees fresh data.
+      this.saveCurrentMaskScope()
+    } catch {}
+    try {
+      return this.layerRegionConditionMaskCanvas(layerId, region)
+    } catch {
+      return null
+    }
+  }
+
   public getLayerChannelMaskCanvas(layerId: string, channel: MaskChannel): HTMLCanvasElement | null {
     if (!layerId) return null
     // Flush the live drawing canvas (``maskCanvasElement``) into the
