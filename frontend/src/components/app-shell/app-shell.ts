@@ -351,10 +351,15 @@ export class RtdAppShell extends LitElement {
    * ``prompt_mask: undefined`` in its inline export, so this patch step
    * is the only way to ship the painted mask through the legacy field.
    */
+  private _patchLegacyPromptMasksLastSig = ''
   private _patchLegacyPromptMasks(layerConditions: LegacyLayerCondition[], w: number, h: number): void {
     const editor = this._editor
     if (!editor) return
-    const cache = new Map<string, string>()
+    const cache = new Map<string, { url: string; nz: number }>()
+    let patched = 0
+    let skippedHadDataUrl = 0
+    let skippedNoCanvas = 0
+    let skippedEmptyLift = 0
     for (const cond of layerConditions) {
       const layerId = String((cond.layer_id ?? '') as string)
       if (!layerId) continue
@@ -365,22 +370,43 @@ export class RtdAppShell extends LitElement {
       // mask entirely. Same logic for cfg/denoise -- only honour an
       // existing field if it's already a data URL.
       const existing = typeof cond.prompt_mask === 'string' ? cond.prompt_mask : ''
-      if (existing.startsWith('data:')) continue
+      if (existing.startsWith('data:')) { skippedHadDataUrl++; continue }
       if (!cache.has(layerId)) {
         const canvas = editor.getLayerChannelMaskCanvas(layerId, 'prompt')
-        const mask = canvas ? this._lift8BitMask(canvas, w, h) : null
-        cache.set(layerId, mask ? this._encodeMaskToDataUrl(mask, w, h) : '')
+        if (!canvas) { cache.set(layerId, { url: '', nz: -1 }); continue }
+        const mask = this._lift8BitMask(canvas, w, h)
+        if (!mask) { cache.set(layerId, { url: '', nz: 0 }); continue }
+        let nz = 0
+        for (let i = 0; i < mask.length; i++) if (mask[i] > 0) nz++
+        cache.set(layerId, { url: this._encodeMaskToDataUrl(mask, w, h), nz })
       }
-      const url = cache.get(layerId)
-      if (url) {
-        cond.prompt_mask = url
-        // The WebRTC splitter extracts ``prompt_mask`` into a blob ref and
-        // then DELETES the inline field. If a stale ``prompt_mask_ref_name``
-        // was set in a previous frame (different mask shape), the splitter
-        // would happily keep using the stale ref. Clearing it forces a
-        // fresh extraction.
-        delete (cond as Record<string, unknown>).prompt_mask_ref_name
+      const entry = cache.get(layerId)
+      if (!entry || !entry.url) {
+        if (entry?.nz === -1) skippedNoCanvas++
+        else skippedEmptyLift++
+        continue
       }
+      cond.prompt_mask = entry.url
+      // The WebRTC splitter extracts ``prompt_mask`` into a blob ref and
+      // then DELETES the inline field. If a stale ``prompt_mask_ref_name``
+      // was set in a previous frame (different mask shape), the splitter
+      // would happily keep using the stale ref. Clearing it forces a
+      // fresh extraction.
+      delete (cond as Record<string, unknown>).prompt_mask_ref_name
+      patched++
+    }
+    // Log on state change so the user can see in devtools whether the
+    // patch did anything this frame. Most useful field: ``patched`` -- if
+    // 0 the painted prompt mask is NOT reaching the backend's legacy
+    // ``condition.prompt_mask`` field and the SDXL regional CLIP attention
+    // will skip with reason ``"no painted prompt_mask"``.
+    const sig = `p=${patched}|sExisting=${skippedHadDataUrl}|sNoCv=${skippedNoCanvas}|sEmpty=${skippedEmptyLift}|nzs=${[...cache.values()].map(e => e.nz).join(',')}`
+    if (sig !== this._patchLegacyPromptMasksLastSig) {
+      this._patchLegacyPromptMasksLastSig = sig
+      console.info('[rtd-v2 patch]', {
+        patched, skippedHadDataUrl, skippedNoCanvas, skippedEmptyLift,
+        layerNzCounts: Object.fromEntries([...cache.entries()].map(([k, v]) => [k, v.nz])),
+      })
     }
   }
 
