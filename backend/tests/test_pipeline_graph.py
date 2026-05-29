@@ -359,18 +359,20 @@ class TestResolveConditioningMask:
         assert resolved.strength == pytest.approx(0.2)
 
     def test_relative_denoise_survives_in_output_mask(self):
-        alpha = Image.new("L", (32, 32), 0)
-        alpha.paste(255, (0, 0, 16, 32))
-        rgba = Image.new("RGBA", (32, 32), (128, 64, 32, 0))
-        rgba.putalpha(alpha)
+        # ``_condition_alpha`` only reads ``denoise_mask`` now (the prompt
+        # softmap and inpaint mask are decoupled per user spec). Build the
+        # denoise softmap as a half-coverage L-mode PNG; the painted
+        # alpha values become the soft per-pixel weight.
+        denoise_alpha = Image.new("L", (32, 32), 0)
+        denoise_alpha.paste(255, (0, 0, 16, 32))
         buf = io.BytesIO()
-        rgba.save(buf, "PNG")
-        region_url = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+        denoise_alpha.save(buf, "PNG")
+        denoise_url = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
 
         base = Image.new("L", (32, 32), 255)
         conds = [{
             "mode": "mask",
-            "image": region_url,
+            "denoise_mask": denoise_url,
             "weight": 1.0,
             "denoise": 0.25,
             "schedule": "linear",
@@ -387,33 +389,36 @@ class TestResolveConditioningMask:
     def test_override_painters_algorithm(self):
         """Layer A (bottom, denoise=0, override, full) then Layer B (top, denoise=1.0,
         override, left half) → only left half is in mask; strength = 1.0."""
-        # Build a half-white PNG for Layer B (left 16 columns white, right 16 black)
+        # Per the decoupled semantics, conditions must explicitly carry
+        # a denoise_mask to contribute to the inpaint mask; ``image`` is
+        # no longer read here. Build both layers' denoise softmaps:
+        # Layer A = full white (covers everything), Layer B = left-half
+        # white (covers left columns only).
+        import io as _io, base64 as _b64
+        a_alpha = Image.new("L", (32, 32), 255)
+        a_buf = _io.BytesIO(); a_alpha.save(a_buf, "PNG")
+        a_url = "data:image/png;base64," + _b64.b64encode(a_buf.getvalue()).decode()
+
         b_alpha = Image.new("L", (32, 32), 0)
         import PIL.ImageDraw as _draw
         _draw.Draw(b_alpha).rectangle([0, 0, 15, 31], fill=255)
-        b_rgba = Image.new("RGBA", (32, 32), (128, 64, 32, 0))
-        b_rgba.putalpha(b_alpha)
-        import io as _io, base64 as _b64
-        buf = _io.BytesIO()
-        b_rgba.save(buf, "PNG")
-        b_url = "data:image/png;base64," + _b64.b64encode(buf.getvalue()).decode()
+        b_buf = _io.BytesIO(); b_alpha.save(b_buf, "PNG")
+        b_url = "data:image/png;base64," + _b64.b64encode(b_buf.getvalue()).decode()
 
         base = Image.new("L", (32, 32), 255)
         conds = [
-            # Layer A: full coverage, denoise=0, override (bottom of stack)
             {
                 "mode": "override",
-                "image": _opaque_png_data_url((32, 32)),
+                "denoise_mask": a_url,
                 "weight": 1.0,
                 "denoise": 0.0,
                 "schedule": "linear",
                 "schedule_start": 0.0,
                 "schedule_end": 1.0,
             },
-            # Layer B: left-half coverage, denoise=1.0, override (top of stack)
             {
                 "mode": "override",
-                "image": b_url,
+                "denoise_mask": b_url,
                 "weight": 1.0,
                 "denoise": 0.999,
                 "schedule": "linear",
@@ -423,9 +428,7 @@ class TestResolveConditioningMask:
         ]
         resolved = resolve_conditioning_mask(base, conds, 32, 32, 0.5)
         arr = np.asarray(resolved.mask, dtype=np.uint8)
-        # Left half: B's override of 1.0 → white in mask
         assert int(arr[:, :16].max()) == 255
-        # Right half: A's override of 0 → black in mask (nothing to inpaint)
         assert int(arr[:, 16:].max()) == 0
         assert resolved.strength > 0.9
 

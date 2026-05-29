@@ -354,38 +354,38 @@ def _cond_get(cond: Any, key: str, default: Any = None) -> Any:
 
 def _condition_alpha(cond: Any, width: int, height: int) -> np.ndarray | None:
     """Return the spatial alpha map a condition contributes to the inpaint
-    mask. Priority order (matches engine._regional_prompt_mask):
+    mask. Reads ONLY ``denoise_mask`` -- the painted denoise softmap.
 
-      1. ``denoise_mask`` -- explicit denoise channel paint, soft weight.
-      2. ``image`` alpha  -- per-region painted area extracted via colour
-         match in ``exportLayerRegionConditionImage``. The painted alpha
-         IS the soft weight per the user-confirmed design ("paint =
-         weight, color = ID"). Without this fallback, painting a coloured
-         region with a prompt produces only regional attention but no
-         inpaint mask -- so the engine never repaints that area and the
-         prompt has no visible effect (the user-reported "no cat" bug).
+    Decoupled from the prompt softmap on purpose. Per the user-defined
+    semantics, the three layer channels are independent:
+
+      - prompt softmap   -> drives WHICH prompt at each pixel (regional
+                            CLIP attention; see engine._regional_prompt_mask).
+      - denoise softmap  -> per-pixel multiplier on base inpaint strength.
+                            Default (unpainted) = full base strength
+                            everywhere (the engine's empty_mask + scene
+                            mask + all-white fallback handle that).
+      - cfg softmap      -> per-pixel CFG override; default = global CFG.
+
+    An earlier version made this fall back to ``condition.image`` alpha
+    (the prompt softmap area) which produced soft-edged inpaint masks
+    that blended the new content with untouched source pixels at the
+    boundary -- visible "ugly" edges. The painted prompt area is for
+    regional attention; the engine's existing scene/empty-mask logic
+    plus a full-canvas fallback when no mask is painted is enough for
+    "paint a prompt and see content there" to work.
     """
     image_url = _cond_get(cond, "denoise_mask", "")
-    if image_url:
-        try:
-            _, sep, payload = str(image_url).partition(",")
-            raw = base64.b64decode(payload if sep else str(image_url))
-            img = Image.open(io.BytesIO(raw)).resize((width, height), Image.Resampling.LANCZOS)
-            return np.asarray(img.convert("L"), dtype=np.float32) / 255.0
-        except Exception as exc:
-            logger.warning("Conditioning denoise_mask decode failed: %s", exc)
-    # Fallback: per-region image alpha.
-    region_image_url = _cond_get(cond, "image", "")
-    if region_image_url:
-        try:
-            _, sep, payload = str(region_image_url).partition(",")
-            raw = base64.b64decode(payload if sep else str(region_image_url))
-            img = Image.open(io.BytesIO(raw)).resize((width, height), Image.Resampling.LANCZOS)
-            rgba = img.convert("RGBA")
-            return np.asarray(rgba.split()[-1], dtype=np.float32) / 255.0
-        except Exception as exc:
-            logger.warning("Conditioning image-alpha fallback decode failed: %s", exc)
-    return None
+    if not image_url:
+        return None
+    try:
+        _, sep, payload = str(image_url).partition(",")
+        raw = base64.b64decode(payload if sep else str(image_url))
+        img = Image.open(io.BytesIO(raw)).resize((width, height), Image.Resampling.LANCZOS)
+        return np.asarray(img.convert("L"), dtype=np.float32) / 255.0
+    except Exception as exc:
+        logger.warning("Conditioning denoise_mask decode failed: %s", exc)
+        return None
 
 
 def _valid_operator(value: str) -> str:

@@ -55,30 +55,15 @@ export function aggregate(scene: Scene): AggregatedScene {
     }
   }
 
-  // "Conceptual painting" rule: any pixel covered by a painted prompt
-  // mask gets denoise bumped toward 1.0 so the engine fully replaces
-  // that area with the prompt's content instead of blending with the
-  // underlying source at the scene's base_denoise. Matches the backend
-  // resolve_conditioning_mask default of 0.95 for prompt-bearing
-  // regions. Applies regardless of rgba state -- the painted prompt
-  // mask is enough on its own, no rgba inpaint mask required (the
-  // user-confirmed design: "a prompt alone is enough for conceptual
-  // inpainting").
-  //
-  // Whole-canvas prompts (mask=null) are skipped: they have no spatial
-  // extent and would otherwise force denoise=1 across the whole scene.
-  const CONCEPT_DENOISE = 0.95
-  for (let i = 0; i < pixelCount; i++) {
-    let promptCover = 0
-    for (const p of prompts) {
-      if (p.mask === null) continue
-      const v = p.mask[i]
-      if (v > promptCover) promptCover = v
-    }
-    if (promptCover <= 0) continue
-    const target = CONCEPT_DENOISE * promptCover
-    if (target > denoiseMap[i]) denoiseMap[i] = target
-  }
+  // No "painted prompt bumps denoise" rule here. The three channels are
+  // independent per the user-defined semantics:
+  //   - prompt softmap   -> drives WHICH prompt (regional attention)
+  //   - denoise softmap  -> drives per-pixel denoise strength
+  //   - cfg softmap      -> drives per-pixel cfg
+  // Coupling the prompt softmap into the denoise map produced soft-edged
+  // inpaint zones that blended awkwardly with the surrounding source.
+  // Default denoise everywhere is the scene's ``baseDenoise``; painted
+  // denoise masks override per-pixel.
 
   return {
     width,

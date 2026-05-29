@@ -130,39 +130,38 @@ describe('aggregate', () => {
     expect(out.prompts.map(p => p.text)).toEqual(['real'])
   })
 
-  it('conceptual painting: painted prompt mask bumps denoise toward 0.95', () => {
-    // Per user-confirmed design ("a prompt alone is enough for conceptual
-    // inpainting; the rgba inpaint mask is OPTIONAL"): any pixel covered
-    // by a painted prompt mask gets denoise pushed to CONCEPT_DENOISE *
-    // mask_value, regardless of rgba state. Background pixels (no prompt
-    // cover) stay at base_denoise.
+  it('decoupled channels: painted prompt softmap does NOT change denoise map', () => {
+    // The three layer channels (prompt / denoise / cfg) are independent
+    // per the user-defined semantics. Painting a prompt softmap drives
+    // regional CLIP attention only; it does not modify the denoise map.
     const s = new Scene({ width: 2, height: 1, baseDenoise: 0.2 })
-    const layer = new Layer({ id: 'L', width: 2, height: 1 })
-    layer.addPrompt({ text: 'a cat', mask: new Uint8ClampedArray([255, 0]), bind: 'self' })
-    s.addLayer(layer)
-    const out = aggregate(s)
-    expect(out.denoiseMap[0]).toBeCloseTo(0.95, 4)
-    expect(out.denoiseMap[1]).toBeCloseTo(0.2, 4)
-  })
-
-  it('conceptual painting: opaque rgba is no longer a free pass to skip the bump', () => {
-    // Earlier rule conditioned the bump on rgba being transparent. The
-    // user's actual workflow is "paint a region on top of a video frame
-    // and prompt it" -- the rgba IS opaque in the painted area, and the
-    // bump must still fire there so the prompt replaces the source.
-    const s = new Scene({ width: 2, height: 1, baseDenoise: 0.3 })
     const layer = new Layer({
       id: 'L', width: 2, height: 1,
-      rgba: new Uint8ClampedArray([200, 0, 0, 255, 0, 0, 0, 0]),
-      denoise: 0.3, denoiseBind: 'rgba',
+      denoise: 0.2, denoiseBind: 'none',
     })
     layer.addPrompt({ text: 'a cat', mask: new Uint8ClampedArray([255, 0]), bind: 'self' })
     s.addLayer(layer)
     const out = aggregate(s)
-    expect(out.denoiseMap[0]).toBeCloseTo(0.95, 4)
+    // Both pixels stay at scene baseDenoise regardless of where the
+    // prompt softmap was painted.
+    expect(out.denoiseMap[0]).toBeCloseTo(0.2, 4)
+    expect(out.denoiseMap[1]).toBeCloseTo(0.2, 4)
   })
 
-  it('conceptual painting: whole-canvas prompt (mask=null) does NOT bump anything', () => {
+  it('decoupled channels: opaque rgba + painted prompt also leaves denoise alone', () => {
+    const s = new Scene({ width: 2, height: 1, baseDenoise: 0.3 })
+    const layer = new Layer({
+      id: 'L', width: 2, height: 1,
+      rgba: new Uint8ClampedArray([200, 0, 0, 255, 0, 0, 0, 0]),
+      denoise: 0.3, denoiseBind: 'none',
+    })
+    layer.addPrompt({ text: 'a cat', mask: new Uint8ClampedArray([255, 0]), bind: 'self' })
+    s.addLayer(layer)
+    const out = aggregate(s)
+    expect(out.denoiseMap[0]).toBeCloseTo(0.3, 4)
+  })
+
+  it('decoupled channels: whole-canvas prompt (mask=null) does NOT bump anything', () => {
     // A prompt with no spatial mask must NOT push the denoise map to
     // max across the entire canvas -- that would force the engine to
     // regenerate every pixel, defeating layered composition.
