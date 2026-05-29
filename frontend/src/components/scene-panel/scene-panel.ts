@@ -433,10 +433,13 @@ export class RtdScenePanel extends LitElement {
       ${this._renderModelPicker(sc.selectedModel, assets.catalog.models)}
       <div class="sampling-grid">
         <rtd-number label="Denoise" .value=${sc.strength} min="0" max="0.999" step="0.01" decimals="2"
+          title=${'Per-pixel inpaint strength. 1.0 = engine starts from pure noise (any painted RGBA/sketch is ignored as a starting image; only prompts drive the output). Lower values preserve more of the source image: ~0.85 keeps silhouettes, ~0.6 keeps shapes, ~0.4 only refines fine details. Override per pixel by painting the layer\'s Denoise mask.'}
           @rtd-change=${(e: CustomEvent) => $scene.setKey('strength', clamp(e.detail.value, 0, 0.999, sc.strength))}></rtd-number>
         <rtd-number label="CFG" .value=${sc.cfg} min="0" max="30" step="0.1" decimals="1"
+          title=${'Classifier-free guidance scale. Higher = engine follows the prompt more strictly. ~6-9 is typical for SDXL. Override per pixel by painting the layer\'s CFG mask.'}
           @rtd-change=${(e: CustomEvent) => $scene.setKey('cfg', clamp(e.detail.value, 0, 30, sc.cfg))}></rtd-number>
         <rtd-number label="Steps" .value=${sc.steps} min="1" max="128" step="1" decimals="0"
+          title=${'Number of denoising steps per frame. More steps = higher quality but slower; 20-30 is typical for SDXL, 4-8 for Turbo/LCM.'}
           @rtd-change=${(e: CustomEvent) => $scene.setKey('steps', Math.round(clamp(e.detail.value, 1, 128, sc.steps)))}></rtd-number>
       </div>
       <div class="field inline">
