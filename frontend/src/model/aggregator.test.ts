@@ -130,24 +130,26 @@ describe('aggregate', () => {
     expect(out.prompts.map(p => p.text)).toEqual(['real'])
   })
 
-  it('generate-from-noise: transparent rgba under painted prompt bumps denoise toward 1', () => {
-    // 2-pixel layer with no rgba content, a prompt with a mask painted
-    // on pixel 0 only. denoise_map at pixel 0 should be the prompt's
-    // attention (1.0) even though scene base_denoise is small.
+  it('conceptual painting: painted prompt mask bumps denoise toward 0.95', () => {
+    // Per user-confirmed design ("a prompt alone is enough for conceptual
+    // inpainting; the rgba inpaint mask is OPTIONAL"): any pixel covered
+    // by a painted prompt mask gets denoise pushed to CONCEPT_DENOISE *
+    // mask_value, regardless of rgba state. Background pixels (no prompt
+    // cover) stay at base_denoise.
     const s = new Scene({ width: 2, height: 1, baseDenoise: 0.2 })
     const layer = new Layer({ id: 'L', width: 2, height: 1 })
     layer.addPrompt({ text: 'a cat', mask: new Uint8ClampedArray([255, 0]), bind: 'self' })
     s.addLayer(layer)
     const out = aggregate(s)
-    expect(out.denoiseMap[0]).toBeCloseTo(1.0, 4)
-    expect(out.denoiseMap[1]).toBeCloseTo(0.2, 4)  // no prompt cover here -> base only
+    expect(out.denoiseMap[0]).toBeCloseTo(0.95, 4)
+    expect(out.denoiseMap[1]).toBeCloseTo(0.2, 4)
   })
 
-  it('generate-from-noise: opaque rgba under painted prompt does NOT bump (transform case)', () => {
-    // The layer has opaque rgba -> the engine should transform existing
-    // pixels using the prompt, not regenerate from noise. With layer
-    // denoise set to scene base (the typical case), denoise_map stays
-    // at base wherever the bump rule decides not to fire.
+  it('conceptual painting: opaque rgba is no longer a free pass to skip the bump', () => {
+    // Earlier rule conditioned the bump on rgba being transparent. The
+    // user's actual workflow is "paint a region on top of a video frame
+    // and prompt it" -- the rgba IS opaque in the painted area, and the
+    // bump must still fire there so the prompt replaces the source.
     const s = new Scene({ width: 2, height: 1, baseDenoise: 0.3 })
     const layer = new Layer({
       id: 'L', width: 2, height: 1,
@@ -157,28 +159,20 @@ describe('aggregate', () => {
     layer.addPrompt({ text: 'a cat', mask: new Uint8ClampedArray([255, 0]), bind: 'self' })
     s.addLayer(layer)
     const out = aggregate(s)
-    // pixel 0 has rgba alpha=255 -> bump skipped, denoise stays base.
-    expect(out.denoiseMap[0]).toBeCloseTo(0.3, 4)
+    expect(out.denoiseMap[0]).toBeCloseTo(0.95, 4)
   })
 
-  it('generate-from-noise: lower opaque layer protects upper prompt area from bump', () => {
-    // Bottom layer fully opaque -> after composition rgba is opaque
-    // -> upper layer's prompt-on-transparent does NOT trigger bump.
+  it('conceptual painting: whole-canvas prompt (mask=null) does NOT bump anything', () => {
+    // A prompt with no spatial mask must NOT push the denoise map to
+    // max across the entire canvas -- that would force the engine to
+    // regenerate every pixel, defeating layered composition.
     const s = new Scene({ width: 2, height: 1, baseDenoise: 0.25 })
-    const bottom = new Layer({
-      id: 'B', width: 2, height: 1,
-      rgba: new Uint8ClampedArray([100, 100, 100, 255, 100, 100, 100, 255]),
-      denoise: 0.25, denoiseBind: 'rgba',
-    })
-    const top = new Layer({
-      id: 'T', width: 2, height: 1,
-      denoise: 0.25, denoiseBind: 'rgba',
-    })
-    top.addPrompt({ text: 'overlay', mask: new Uint8ClampedArray([255, 0]), bind: 'self' })
-    s.addLayer(bottom)
-    s.addLayer(top)
+    const layer = new Layer({ id: 'L', width: 2, height: 1, denoise: 0.25, denoiseBind: 'none' })
+    layer.addPrompt({ text: 'global', bind: 'none' })  // mask=null
+    s.addLayer(layer)
     const out = aggregate(s)
     expect(out.denoiseMap[0]).toBeCloseTo(0.25, 4)
+    expect(out.denoiseMap[1]).toBeCloseTo(0.25, 4)
   })
 
   it('controlnet emitted per layer that has one', () => {

@@ -55,24 +55,29 @@ export function aggregate(scene: Scene): AggregatedScene {
     }
   }
 
-  // "Generate from noise" rule: where the final composited rgba is
-  // transparent (no pixel data anywhere below this point) and ANY prompt
-  // covers the pixel, push denoise toward the prompt's attention. Without
-  // this, painting a prompt mask on a fresh empty layer feels broken --
-  // the engine runs img2img over a neutral-gray fallback with denoise
-  // capped at scene baseDenoise (~0.6 typical), so the prompt only mildly
-  // tints the gray. With the bump, denoise reaches the prompt's
-  // attention value (up to 1.0), telling the engine to treat that area
-  // as pure noise and synthesise the prompt's content from scratch.
+  // "Conceptual painting" rule: any pixel covered by a painted prompt
+  // mask gets denoise bumped toward 1.0 so the engine fully replaces
+  // that area with the prompt's content instead of blending with the
+  // underlying source at the scene's base_denoise. Matches the backend
+  // resolve_conditioning_mask default of 0.95 for prompt-bearing
+  // regions. Applies regardless of rgba state -- the painted prompt
+  // mask is enough on its own, no rgba inpaint mask required (the
+  // user-confirmed design: "a prompt alone is enough for conceptual
+  // inpainting").
+  //
+  // Whole-canvas prompts (mask=null) are skipped: they have no spatial
+  // extent and would otherwise force denoise=1 across the whole scene.
+  const CONCEPT_DENOISE = 0.95
   for (let i = 0; i < pixelCount; i++) {
-    if (rgba[i * 4 + 3] > 8) continue
     let promptCover = 0
     for (const p of prompts) {
-      if (p.mask === null) { promptCover = 1; break }
+      if (p.mask === null) continue
       const v = p.mask[i]
       if (v > promptCover) promptCover = v
     }
-    if (promptCover > denoiseMap[i]) denoiseMap[i] = promptCover
+    if (promptCover <= 0) continue
+    const target = CONCEPT_DENOISE * promptCover
+    if (target > denoiseMap[i]) denoiseMap[i] = target
   }
 
   return {
