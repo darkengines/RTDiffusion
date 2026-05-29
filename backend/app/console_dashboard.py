@@ -121,10 +121,38 @@ class ConsoleDashboard:
             "v2 masks (last frame seen by each session)",
             self._render_v2_masks_table(sessions, width),
             "",
+            "v2 mask state (full canvas-editor snapshot, per session)",
+            self._render_v2_mask_state(sessions, width),
+            "",
             "Tasks",
             self._render_tasks_table(tasks, width),
         ]
         return "\n".join(lines)
+
+    def _render_v2_mask_state(self, sessions: list[dict[str, object]], width: int) -> str:
+        # One line per session showing the full canvas-editor mask state
+        # snapshot. The per-row status column in the v2 masks table caps at
+        # ~36 chars and hides the most actionable diagnostic field: the
+        # ``channelMaskKeys`` list. This section shows it in full (up to
+        # terminal width). For each session, also a "rows status" line
+        # showing each row's full status string in case the per-row table
+        # truncated it.
+        out_lines: list[str] = []
+        for session in sessions:
+            tag = str(session.get("tag") or "-")[:8]
+            meta = session.get("v2_diag_meta") or {}
+            state_full = str(meta.get("state_full") or "(no state captured yet)")
+            out_lines.append(f"[{tag}] {state_full}")
+            for row in (session.get("v2_diag_rows") or []):
+                kind = str(row.get("kind") or "?")
+                layer = str(row.get("layer") or "?")[:36]
+                region = str(row.get("region") or "")[:16]
+                prompt = str(row.get("prompt") or "(no prompt)")[:24]
+                status = str(row.get("pm_status") or "")
+                out_lines.append(f"[{tag}]   {kind}:{layer} | {region} | {prompt} -> {status}")
+        if not out_lines:
+            return "(no sessions yet)"
+        return "\n".join(out_lines)
 
     def _render_v2_masks_table(self, sessions: list[dict[str, object]], width: int) -> str:
         # Aggregate one row per (session, layer condition) plus per (session,

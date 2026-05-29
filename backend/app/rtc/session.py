@@ -576,6 +576,17 @@ class InpaintSession:
                     "cfg": None,
                     "denoise": None,
                 })
+        # Pull the frontend-side full state snapshot off the first cond
+        # (the augmentation stamps it once per frame). This gets shown on
+        # a dedicated line below the v2 masks table -- the per-row status
+        # column truncates to 36 chars and hides the channelMaskKeys list,
+        # which is the most useful field for diagnosing "no canvas" misses.
+        state_full = ""
+        for cond in materialized_conditions:
+            sv = cond.get("_v2_state_full")
+            if isinstance(sv, str) and sv:
+                state_full = sv
+                break
         self._v2_diag_rows = rows
         self._v2_diag_meta = {
             "base_prompt": (base_prompt or "")[:32],
@@ -583,6 +594,7 @@ class InpaintSession:
             "base_denoise": float(base_denoise),
             "width": int(w),
             "height": int(h),
+            "state_full": state_full,
         }
 
     @property
@@ -2088,6 +2100,17 @@ class InpaintSession:
                     base_cfg=composed_cfg,
                     base_denoise=base_denoise,
                     w=w, h=h,
+                )
+                # Also emit a single-line summary as a backend log so the
+                # diagnostic survives even if the dashboard isn't active.
+                logger.info(
+                    "v2-diag[%s] %d row(s): %s",
+                    self._tag,
+                    len(self._v2_diag_rows),
+                    " | ".join(
+                        f"{r.get('layer')}:{r.get('region')}={r.get('pm_status')}"
+                        for r in self._v2_diag_rows
+                    )[:280],
                 )
             except Exception:
                 pass

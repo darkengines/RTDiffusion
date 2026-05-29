@@ -363,6 +363,15 @@ export class RtdAppShell extends LitElement {
     const stateBrief = stateSnapshot
       ? `act=${stateSnapshot.activeScope.slice(0, 18)}/${stateSnapshot.activeChannel}|chKeys=${stateSnapshot.channelKeys.length}|live=${stateSnapshot.liveCanvasReady ? 'y' : 'n'}`
       : 'no-snapshot'
+    // Full snapshot as a SEPARATE field on the first condition. Dashboard
+    // renders this on its own line below the v2 masks table so the long
+    // ``channelKeys`` list isn't truncated by the per-row status column.
+    const stateFull = stateSnapshot
+      ? `active=${stateSnapshot.activeScope}/${stateSnapshot.activeChannel} live=${stateSnapshot.liveCanvasReady ? 'y' : 'n'} channelMaskKeys=[${stateSnapshot.channelKeys.join(', ')}] sceneScopes=[${stateSnapshot.sceneScopes.join(', ')}]`
+      : 'no-snapshot'
+    if (layerConditions.length > 0) {
+      ;(layerConditions[0] as Record<string, unknown>)._v2_state_full = stateFull
+    }
     const cache = new Map<string, { url: string; nz: number }>()
     let patched = 0
     let skippedHadDataUrl = 0
