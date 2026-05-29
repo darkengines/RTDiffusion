@@ -6,6 +6,7 @@ import { $scene } from '../../stores/scene.store'
 import { $assets } from '../../stores/assets.store'
 import type {
   LayerItem,
+  LayerPreset,
   MaskChannel,
   RegionItem,
   RegionSchedule,
@@ -135,6 +136,41 @@ export class RtdLayerPanel extends LitElement {
         ${this.numCtrl('', fillValue, 0, 1, 0.01, 2, (v) => { this.fillViewportValue = clamp(v, 0, 1, this.fillViewportValue) })}
       </div>
       <button class="small-btn" @click=${() => this.emit('rtd-mask-clear', { layerId, channel, regionId })}>Clear</button>
+    </div>`
+  }
+
+  /**
+   * Edge feather control for a single channel. Signed pixel count:
+   *   +N grows the painted mask outward (gradient extends out)
+   *   -N shrinks the mask inward (gradient extends in)
+   *    0 hard edges
+   * Default = 8. Applied client-side; consistent across both engines.
+   */
+  private renderFeatherControl(
+    layerId: string,
+    channel: 'rgba' | 'cfg' | 'denoise' | 'prompt',
+    layer: LayerItem,
+  ): TemplateResult {
+    const fieldName: keyof LayerPreset = (
+      channel === 'rgba' ? 'rgbaFeather'
+        : channel === 'cfg' ? 'cfgFeather'
+          : channel === 'denoise' ? 'denoiseFeather'
+            : 'promptFeather'
+    )
+    const value = Number(layer.preset[fieldName] ?? 8)
+    const tip = `Edge feather, signed pixel count.
+  +N: gradient extends N px OUTSIDE the painted area (mask grows softly).
+  -N: gradient extends |N| px INSIDE the painted area (mask shrinks softly).
+   0: hard edges.
+Applied client-side to the ${channel} softmap before the engine sees it,
+consistent across SDXL and StreamDiffusion paths.`
+    return html`<div class="region-meta" style="display:flex; align-items:center; gap:6px; padding:4px 0;" title=${tip}>
+      <span style="opacity:0.7; flex:1;">Blending feather</span>
+      ${this.numCtrl('', value, -128, 128, 1, 0, (v) => {
+        const patch: Partial<LayerPreset> = { [fieldName]: Math.round(clamp(v, -128, 128, value)) } as Partial<LayerPreset>
+        this.emit('rtd-layer-preset', { id: layerId, patch })
+      })}
+      <span style="opacity:0.5; min-width:28px; text-align:right;">${value >= 0 ? `+${value}` : value}px</span>
     </div>`
   }
 
@@ -655,7 +691,7 @@ export class RtdLayerPanel extends LitElement {
         <button class="small-btn" @click=${() => this.emit('rtd-mask-select', { layerId: layer.id, channel: 'color' as MaskChannel })}>Paint</button>
       </div>
       ${this.renderMaskActionControls(layer.id, 'color', undefined, { includePaint: false, includeFit: false })}
-
+      ${this.renderFeatherControl(layer.id, 'rgba', layer)}
     </section>`
   }
 
@@ -674,6 +710,7 @@ export class RtdLayerPanel extends LitElement {
       </div>
       <div class="region-meta">${description}</div>
       ${this.renderMaskActionControls(layer.id, channel)}
+      ${this.renderFeatherControl(layer.id, channel, layer)}
     </section>`
   }
 
@@ -710,7 +747,9 @@ export class RtdLayerPanel extends LitElement {
                 <textarea rows="2" .value=${region.negativePrompt}
                   @input=${(e: Event) => this.emit('rtd-region-update', { id: region.id, patch: { negativePrompt: (e.target as HTMLTextAreaElement).value, inherited: false } })}></textarea>
               </label>
-
+              ${target === 'layer' && layerId
+                ? this.renderFeatherControl(layerId, 'prompt', this._layer.value.layers.find(l => l.id === layerId)!)
+                : ''}
             </section>`)}
           </div>`
         : html`<div class="variation-empty empty">No named masks yet</div>`}

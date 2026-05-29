@@ -38,6 +38,7 @@ import type { LayerPreset, MaskChannel, RegionItem, RegionTarget, ScenePanelTab,
 import { aggregate } from '../../model/aggregator'
 import { aggregatedToWire, createCanvasPngEncoder } from '../../model/encoder'
 import { buildSceneFromLayerConditions, createDomImageDecoder, type LegacyLayerCondition, type MaskChannelKind } from '../../model/from-layer-conditions'
+import { featherMask } from '../../paint/feather'
 
 import '../toolbar/toolbar'
 import '../layer-list/layer-list'
@@ -379,23 +380,68 @@ export class RtdAppShell extends LitElement {
       try {
         const canvas = editor.getRegionColorMaskCanvas(layerId, regionId)
         if (!canvas) continue
-        // Cheap "any non-zero alpha" probe via a small downscaled read.
-        // If the painted area is entirely empty, leave cond.image alone.
-        const probe = document.createElement('canvas')
-        probe.width = 32
-        probe.height = 32
-        const pctx = probe.getContext('2d', { alpha: true, willReadFrequently: true })
-        if (!pctx) continue
-        pctx.clearRect(0, 0, 32, 32)
-        pctx.drawImage(canvas, 0, 0, 32, 32)
-        const data = pctx.getImageData(0, 0, 32, 32).data
+        const featherPx = Number((cond as Record<string, unknown>).prompt_feather ?? 0) | 0
+        const w = canvas.width, h = canvas.height
+        const ctx = canvas.getContext('2d', { alpha: true, willReadFrequently: true })
+        if (!ctx) continue
+        const id = ctx.getImageData(0, 0, w, h)
+        // Probe non-zero alpha quickly.
         let any = false
-        for (let i = 3; i < data.length; i += 4) if (data[i] > 0) { any = true; break }
+        for (let i = 3; i < id.data.length; i += 4) if (id.data[i] > 0) { any = true; break }
         if (!any) continue
+        // If feathered, replace the alpha channel with the feathered map.
+        if (featherPx !== 0) {
+          const alpha = new Uint8ClampedArray(w * h)
+          for (let i = 0, j = 3; i < alpha.length; i++, j += 4) alpha[i] = id.data[j]
+          const feathered = featherMask(alpha, w, h, featherPx)
+          for (let i = 0, j = 3; i < feathered.length; i++, j += 4) id.data[j] = feathered[i]
+          ctx.putImageData(id, 0, 0)
+        }
         cond.image = canvas.toDataURL('image/png')
         ;(cond as Record<string, unknown>)._v2_image_patched = true
       } catch {
         // ignore, fall through to canvas-editor's whole-layer render
+      }
+    }
+  }
+
+  /**
+   * For each layer with a painted cfg / denoise mask, lift the canvas,
+   * apply the channel's feather, re-encode as a PNG-L data URL, and
+   * overwrite ``cond.cfg_mask`` / ``cond.denoise_mask``. The backend
+   * (``pipeline_graph._condition_alpha`` for denoise; the engine's CFG
+   * decoder for cfg) reads these inline data URLs. Without this patch,
+   * canvas-editor's emission is either undefined (no painted mask) or
+   * an unfeathered raw PNG of the brush strokes -- hard edges produce
+   * banding artifacts in the inpaint mask + cfg overlay.
+   */
+  private _patchLayerChannelMasks(layerConditions: LegacyLayerCondition[], w: number, h: number): void {
+    const editor = this._editor
+    if (!editor) return
+    const cache = new Map<string, string>()
+    for (const cond of layerConditions) {
+      const layerId = String((cond.layer_id ?? '') as string)
+      if (!layerId) continue
+      for (const [channel, condField, featherField] of [
+        ['denoise', 'denoise_mask', 'denoise_feather'] as const,
+        // cfg uses a custom RTF1 binary format -- skip feathering it
+        // here until we add the matching encoder. The user's UI control
+        // for cfg feather still exists; the painted edges flow through
+        // unfeathered for now (TODO: handle RTF1 alpha).
+      ]) {
+        const cacheKey = `${layerId}::${channel}`
+        const feather = Number((cond as Record<string, unknown>)[featherField] ?? 0) | 0
+        if (!cache.has(cacheKey)) {
+          const canvas = editor.getLayerChannelMaskCanvas(layerId, channel)
+          const buf = canvas ? this._lift8BitMask(canvas, w, h) : null
+          if (!buf) { cache.set(cacheKey, ''); continue }
+          const feathered = feather !== 0 ? featherMask(buf, w, h, feather) : buf
+          cache.set(cacheKey, this._encodeMaskToDataUrl(feathered, w, h))
+        }
+        const url = cache.get(cacheKey)
+        if (url) {
+          (cond as Record<string, unknown>)[condField] = url
+        }
       }
     }
   }
@@ -448,9 +494,15 @@ export class RtdAppShell extends LitElement {
           const mask = this._lift8BitMask(canvas, w, h)
           if (!mask) { cache.set(layerId, { url: '', nz: 0 }); }
           else {
+            // Apply prompt-channel feather (signed pixel count) from
+            // the layer preset before encoding. Default = 8 px outward
+            // so painted edges are naturally soft for the regional CLIP
+            // attention rather than producing hard attention boundaries.
+            const featherPx = Number((cond as Record<string, unknown>).prompt_feather ?? 0) | 0
+            const out = featherPx !== 0 ? featherMask(mask, w, h, featherPx) : mask
             let nz = 0
-            for (let i = 0; i < mask.length; i++) if (mask[i] > 0) nz++
-            cache.set(layerId, { url: this._encodeMaskToDataUrl(mask, w, h), nz })
+            for (let i = 0; i < out.length; i++) if (out[i] > 0) nz++
+            cache.set(layerId, { url: this._encodeMaskToDataUrl(out, w, h), nz })
           }
         }
       }
@@ -880,6 +932,7 @@ export class RtdAppShell extends LitElement {
           if (w && h) {
             this._patchLegacyPromptMasks(layerConditions as LegacyLayerCondition[], w, h)
             this._patchCustomRegionImages(layerConditions as LegacyLayerCondition[])
+            this._patchLayerChannelMasks(layerConditions as LegacyLayerCondition[], w, h)
           }
         } catch (err) {
           console.warn('[rtd] legacy condition patch failed', err)

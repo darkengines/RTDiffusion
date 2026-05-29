@@ -61,6 +61,13 @@ export type LayerPreset = {
   denoiseMaskBlendingEnabled: boolean
   denoiseMaskBlendingRadius: number
   denoiseMaskBlendingStrength: number
+  // v2 edge feather (signed pixel count): +N outward, -N inward, 0 hard.
+  // Default 8 per channel. Applied client-side to the painted softmap
+  // before the engine sees it; consistent across SDXL + StreamDiffusion.
+  rgbaFeather: number
+  cfgFeather: number
+  denoiseFeather: number
+  promptFeather: number
 }
 
 export type LayerTransform = {

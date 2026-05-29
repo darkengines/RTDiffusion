@@ -3504,6 +3504,10 @@ export class RtdCanvasEditor extends LitElement {
       denoiseMaskBlendingEnabled: false,
       denoiseMaskBlendingRadius: 32,
       denoiseMaskBlendingStrength: 1,
+      rgbaFeather: 8,
+      cfgFeather: 8,
+      denoiseFeather: 8,
+      promptFeather: 8,
     }
   }
 
@@ -3551,6 +3555,10 @@ export class RtdCanvasEditor extends LitElement {
       denoiseMaskBlendingEnabled: preset.denoiseMaskBlendingEnabled ?? false,
       denoiseMaskBlendingRadius: Math.round(this.clamp(preset.denoiseMaskBlendingRadius ?? 32, -160, 160, 32)),
       denoiseMaskBlendingStrength: this.clamp(preset.denoiseMaskBlendingStrength ?? 1, 0, 4, 1),
+      rgbaFeather: Math.round(this.clamp(preset.rgbaFeather ?? 8, -128, 128, 8)),
+      cfgFeather: Math.round(this.clamp(preset.cfgFeather ?? 8, -128, 128, 8)),
+      denoiseFeather: Math.round(this.clamp(preset.denoiseFeather ?? 8, -128, 128, 8)),
+      promptFeather: Math.round(this.clamp(preset.promptFeather ?? 8, -128, 128, 8)),
     }
   }
 
@@ -5881,6 +5889,12 @@ export class RtdCanvasEditor extends LitElement {
           schedule_start: regionTiming.start,
           schedule_end: regionTiming.end,
           primary_input: this._isVideoLayer(layer.id),
+          // v2 feather (signed pixel count per channel). Read by
+          // RtdAppShell._patch* before encoding to data URLs.
+          rgba_feather: layer.preset.rgbaFeather,
+          cfg_feather: layer.preset.cfgFeather,
+          denoise_feather: layer.preset.denoiseFeather,
+          prompt_feather: layer.preset.promptFeather,
           ...channelRefs,
         })
       }
