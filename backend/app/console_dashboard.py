@@ -166,17 +166,19 @@ class ConsoleDashboard:
         if not rows:
             return "(no v2 mask data yet -- render at least one frame)"
         # Hard cap the prompt column so even a multi-paragraph prompt
-        # can't blow the row past the terminal width. The dashboard
-        # writer truncates lines anyway but a sane column width keeps the
-        # other columns visible.
-        prompt_col = min(40, max(20, width - 120))
+        # can't blow the row past the terminal width. Status column gets
+        # most of the leftover room because that's where the diagnostic
+        # tag (``fe:no-canvas act=... chKeys=... live=...``) lives -- it
+        # needs visible characters to be useful.
+        prompt_col = min(24, max(16, width - 160))
+        status_col = max(36, width - 100)
         columns = [
             ("session", 8),
             ("layer", 22),
             ("region", 12),
             ("prompt", prompt_col),
             ("mask_nz", 8),
-            ("status", 22),
+            ("status", status_col),
             ("cfg", 5),
             ("denoise", 7),
             ("base", 18),

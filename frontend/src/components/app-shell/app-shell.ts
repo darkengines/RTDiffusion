@@ -355,6 +355,14 @@ export class RtdAppShell extends LitElement {
   private _patchLegacyPromptMasks(layerConditions: LegacyLayerCondition[], w: number, h: number): void {
     const editor = this._editor
     if (!editor) return
+    // Snapshot canvas-editor's mask storage state ONCE per frame for the
+    // diagnostic tags. Lets the dashboard show what canvas-editor actually
+    // has, not just our failed lookup.
+    let stateSnapshot: ReturnType<RtdCanvasEditor['maskStateSnapshot']> | null = null
+    try { stateSnapshot = editor.maskStateSnapshot() } catch { stateSnapshot = null }
+    const stateBrief = stateSnapshot
+      ? `act=${stateSnapshot.activeScope.slice(0, 18)}/${stateSnapshot.activeChannel}|chKeys=${stateSnapshot.channelKeys.length}|live=${stateSnapshot.liveCanvasReady ? 'y' : 'n'}`
+      : 'no-snapshot'
     const cache = new Map<string, { url: string; nz: number }>()
     let patched = 0
     let skippedHadDataUrl = 0
@@ -392,10 +400,10 @@ export class RtdAppShell extends LitElement {
       if (!entry.url) {
         if (entry.nz === -1) {
           skippedNoCanvas++
-          ;(cond as Record<string, unknown>)._v2_dbg = 'fe:no-canvas'
+          ;(cond as Record<string, unknown>)._v2_dbg = `fe:no-canvas ${stateBrief}`
         } else {
           skippedEmptyLift++
-          ;(cond as Record<string, unknown>)._v2_dbg = 'fe:empty-lift'
+          ;(cond as Record<string, unknown>)._v2_dbg = `fe:empty-lift ${stateBrief}`
         }
         continue
       }

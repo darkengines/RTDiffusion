@@ -4358,6 +4358,29 @@ export class RtdCanvasEditor extends LitElement {
     return this.existingMaskCanvasForScopeChannel(`layer:${layerId}` as MaskScope, channel) ?? null
   }
 
+  /**
+   * Diagnostic: returns a snapshot of where mask data currently lives so the
+   * v2 augmentation can show in the dashboard which scope+channel keys are
+   * actually populated. Used when ``getLayerChannelMaskCanvas`` returns null
+   * for a layer that should have a painted mask -- the snapshot tells us if
+   * the mask is stored under a key we don't look up.
+   */
+  public maskStateSnapshot(): {
+    activeScope: string
+    activeChannel: string
+    channelKeys: string[]
+    sceneScopes: string[]
+    liveCanvasReady: boolean
+  } {
+    return {
+      activeScope: String(this.activeMaskScope ?? ''),
+      activeChannel: String(this.activeMaskChannel ?? ''),
+      channelKeys: [...this.channelMaskCanvases.keys()],
+      sceneScopes: [...this.maskCanvases.keys()],
+      liveCanvasReady: !!this.maskCanvasElement && this.maskCanvasElement.width > 0,
+    }
+  }
+
   private maskChannelKey(scope: MaskScope, channel: MaskChannel) {
     return `${scope}::${channel}`
   }
