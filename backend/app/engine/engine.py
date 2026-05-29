@@ -2335,12 +2335,24 @@ class DiffusionEngine:
 
     @staticmethod
     def _regional_prompt_mask(condition: LayerCondition, width: int, height: int) -> Image.Image | None:
+        # User-reported bug: "regional CLIP condition is working only on an
+        # existing rgba area, it should apply even without rgba channel."
+        # Root cause was the rgba-alpha fallback below: when a prompt has no
+        # painted prompt_mask, the code took the layer's rgba alpha as the
+        # regional attention mask -- which coupled the prompt's spatial
+        # extent to where the user happened to have painted RGBA pixels.
+        # On a transparent layer the alpha was zero everywhere, so the
+        # regional attention silently degenerated to no effect.
+        #
+        # New behavior: when no prompt_mask is provided the prompt has no
+        # spatial constraint; the regional attention is skipped (caller
+        # treats a None return as "no regional pass for this prompt") and
+        # the prompt still influences output through the base pass / global
+        # prompt aggregation. To get spatial gating, paint a prompt mask.
         try:
-            if condition.prompt_mask:
-                mask = decode_data_url(condition.prompt_mask).convert("L").resize((width, height), Image.Resampling.BILINEAR)
-            else:
-                rgba = decode_data_url_rgba(condition.image).resize((width, height), Image.Resampling.LANCZOS)
-                mask = rgba.getchannel("A")
+            if not condition.prompt_mask:
+                return None
+            mask = decode_data_url(condition.prompt_mask).convert("L").resize((width, height), Image.Resampling.BILINEAR)
             if condition.cfg_mask:
                 cfg_mask = _cfg_mask_attention_alpha(_decode_cfg_mask_data_url(condition.cfg_mask, width, height))
                 return ImageChops.multiply(mask, cfg_mask)

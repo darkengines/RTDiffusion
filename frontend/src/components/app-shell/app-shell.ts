@@ -314,6 +314,60 @@ export class RtdAppShell extends LitElement {
   // shared encode/decode canvas mid-augmentation.
   private _v2MaskCanvas: HTMLCanvasElement | null = null
 
+  /**
+   * Encode a HxW Uint8ClampedArray mask as a "data:image/png;base64,..."
+   * grayscale PNG (luma=mask, alpha=255) -- the format the backend's
+   * legacy ``decode_data_url(condition.prompt_mask).convert('L')`` and
+   * the WebRTC splitter's blob-ref extraction both expect. Reuses the
+   * shared scratch canvas; each call resets width/height which clears
+   * the canvas, so it's safe to interleave with ``_lift8BitMask``.
+   */
+  private _encodeMaskToDataUrl(buf: Uint8ClampedArray, w: number, h: number): string {
+    if (!this._v2MaskCanvas) this._v2MaskCanvas = document.createElement('canvas')
+    const c = this._v2MaskCanvas
+    c.width = w
+    c.height = h
+    const ctx = c.getContext('2d', { alpha: true, willReadFrequently: true })
+    if (!ctx) return ''
+    const rgba = new Uint8ClampedArray(w * h * 4)
+    for (let i = 0, j = 0; i < buf.length; i++, j += 4) {
+      const v = buf[i]
+      rgba[j] = v
+      rgba[j + 1] = v
+      rgba[j + 2] = v
+      rgba[j + 3] = 255
+    }
+    ctx.putImageData(new ImageData(rgba as Uint8ClampedArray<ArrayBuffer>, w, h), 0, 0)
+    return c.toDataURL('image/png')
+  }
+
+  /**
+   * For each layer with a painted prompt mask, encode it once and set it
+   * as ``condition.prompt_mask`` on all of that layer's region entries.
+   * The legacy diffusers engine's ``_regional_prompt_mask`` reads this
+   * field directly; without it, the regional CLIP attention silently fell
+   * back to ``rgba.getchannel('A')`` -- which is why painted prompts only
+   * worked where the user had also painted RGBA. canvas-editor sets
+   * ``prompt_mask: undefined`` in its inline export, so this patch step
+   * is the only way to ship the painted mask through the legacy field.
+   */
+  private _patchLegacyPromptMasks(layerConditions: LegacyLayerCondition[], w: number, h: number): void {
+    const editor = this._editor
+    if (!editor) return
+    const cache = new Map<string, string>()
+    for (const cond of layerConditions) {
+      const layerId = String((cond.layer_id ?? '') as string)
+      if (!layerId || cond.prompt_mask) continue
+      if (!cache.has(layerId)) {
+        const canvas = editor.getLayerChannelMaskCanvas(layerId, 'prompt')
+        const mask = canvas ? this._lift8BitMask(canvas, w, h) : null
+        cache.set(layerId, mask ? this._encodeMaskToDataUrl(mask, w, h) : '')
+      }
+      const url = cache.get(layerId)
+      if (url) cond.prompt_mask = url
+    }
+  }
+
   private _lift8BitMask(source: HTMLCanvasElement, w: number, h: number): Uint8ClampedArray | null {
     try {
       if (source.width === 0 || source.height === 0) return null
@@ -679,6 +733,20 @@ export class RtdAppShell extends LitElement {
           ? await editor.exportLayerConditionsForRtcResources()
           : editor.exportLayerConditions()
         const sceneSettings = this._rtcSceneSettingsPayload()
+        // Patch the legacy ``layer_conditions[*].prompt_mask`` BEFORE the
+        // WebRTC splitter sees the payload -- canvas-editor's inline
+        // exporter sets that field to undefined, which made the engine's
+        // regional CLIP attention fall back to rgba alpha (the
+        // user-reported "regional clip only works on rgba area" bug). The
+        // splitter handles the data-URL form correctly: extracts it as a
+        // blob ref and removes the inline copy.
+        try {
+          const w = Number(sceneSettings.width) || 0
+          const h = Number(sceneSettings.height) || 0
+          if (w && h) this._patchLegacyPromptMasks(layerConditions as LegacyLayerCondition[], w, h)
+        } catch (err) {
+          console.warn('[rtd] legacy prompt_mask patch failed', err)
+        }
         const settings: Record<string, unknown> = {
           image,
           mask,
