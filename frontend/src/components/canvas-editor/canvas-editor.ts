@@ -5943,6 +5943,10 @@ export class RtdCanvasEditor extends LitElement {
           schedule_start: regionTiming.start,
           schedule_end: regionTiming.end,
           primary_input: this._isVideoLayer(layer.id),
+          rgba_feather: layer.preset.rgbaFeather,
+          cfg_feather: layer.preset.cfgFeather,
+          denoise_feather: layer.preset.denoiseFeather,
+          prompt_feather: layer.preset.promptFeather,
         })
       }
     }
@@ -6004,6 +6008,10 @@ export class RtdCanvasEditor extends LitElement {
           schedule_start: regionTiming.start,
           schedule_end: regionTiming.end,
           primary_input: this._isVideoLayer(layer.id),
+          rgba_feather: layer.preset.rgbaFeather,
+          cfg_feather: layer.preset.cfgFeather,
+          denoise_feather: layer.preset.denoiseFeather,
+          prompt_feather: layer.preset.promptFeather,
         })
       }
     }
